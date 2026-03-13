@@ -1,0 +1,25 @@
+# Rust
+target/
+*.wasm
+Cargo.lock
+
+# Node
+node_modules/
+.pnpm-store/
+dist/
+.next/
+out/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
