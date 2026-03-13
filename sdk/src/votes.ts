@@ -1,0 +1,145 @@
+import {
+  Contract,
+  SorobanRpc,
+  TransactionBuilder,
+  Networks,
+  BASE_FEE,
+  Keypair,
+  nativeToScVal,
+  scValToNative,
+} from "@stellar/stellar-sdk";
+import { GovernorConfig, Network } from "./types";
+
+const RPC_URLS: Record<Network, string> = {
+  mainnet: "https://soroban-rpc.mainnet.stellar.gateway.fm",
+  testnet: "https://soroban-testnet.stellar.org",
+  futurenet: "https://rpc-futurenet.stellar.org",
+};
+
+const NETWORK_PASSPHRASES: Record<Network, string> = {
+  mainnet: Networks.PUBLIC,
+  testnet: Networks.TESTNET,
+  futurenet: Networks.FUTURENET,
+};
+
+/**
+ * VotesClient — interact with the token-votes contract.
+ * Handles delegation and voting power queries.
+ *
+ * TODO issue #32: add event subscription for DelegateChanged events.
+ */
+export class VotesClient {
+  private readonly server: SorobanRpc.Server;
+  private readonly contract: Contract;
+  private readonly networkPassphrase: string;
+
+  constructor(config: GovernorConfig) {
+    const rpcUrl = config.rpcUrl ?? RPC_URLS[config.network];
+    this.server = new SorobanRpc.Server(rpcUrl, { allowHttp: false });
+    this.contract = new Contract(config.votesAddress);
+    this.networkPassphrase = NETWORK_PASSPHRASES[config.network];
+  }
+
+  /**
+   * Delegate voting power to another address.
+   * TODO issue #33: add self-delegation option and UI flow.
+   */
+  async delegate(signer: Keypair, delegatee: string): Promise<void> {
+    const account = await this.server.getAccount(signer.publicKey());
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          "delegate",
+          nativeToScVal(signer.publicKey(), { type: "address" }),
+          nativeToScVal(delegatee, { type: "address" })
+        )
+      )
+      .setTimeout(30)
+      .build();
+
+    const prepared = await this.server.prepareTransaction(tx);
+    prepared.sign(signer);
+    await this.server.sendTransaction(prepared);
+  }
+
+  /**
+   * Get current voting power of an address.
+   */
+  async getVotes(account: string): Promise<bigint> {
+    const result = await this.server.simulateTransaction(
+      new TransactionBuilder(
+        await this.server.getAccount(account),
+        { fee: BASE_FEE, networkPassphrase: this.networkPassphrase }
+      )
+        .addOperation(
+          this.contract.call(
+            "get_votes",
+            nativeToScVal(account, { type: "address" })
+          )
+        )
+        .setTimeout(30)
+        .build()
+    );
+
+    if (SorobanRpc.Api.isSimulationError(result)) return 0n;
+    const raw = (result as SorobanRpc.Api.SimulateTransactionSuccessResponse)
+      .result?.retval;
+    return raw ? BigInt(scValToNative(raw)) : 0n;
+  }
+
+  /**
+   * Get voting power at a past ledger sequence.
+   * TODO issue #9 (contract): requires checkpoint binary search to be implemented first.
+   */
+  async getPastVotes(account: string, ledger: number): Promise<bigint> {
+    const result = await this.server.simulateTransaction(
+      new TransactionBuilder(
+        await this.server.getAccount(account),
+        { fee: BASE_FEE, networkPassphrase: this.networkPassphrase }
+      )
+        .addOperation(
+          this.contract.call(
+            "get_past_votes",
+            nativeToScVal(account, { type: "address" }),
+            nativeToScVal(ledger, { type: "u32" })
+          )
+        )
+        .setTimeout(30)
+        .build()
+    );
+
+    if (SorobanRpc.Api.isSimulationError(result)) return 0n;
+    const raw = (result as SorobanRpc.Api.SimulateTransactionSuccessResponse)
+      .result?.retval;
+    return raw ? BigInt(scValToNative(raw)) : 0n;
+  }
+
+  /**
+   * Get current delegatee of an account.
+   */
+  async getDelegatee(account: string): Promise<string | null> {
+    const result = await this.server.simulateTransaction(
+      new TransactionBuilder(
+        await this.server.getAccount(account),
+        { fee: BASE_FEE, networkPassphrase: this.networkPassphrase }
+      )
+        .addOperation(
+          this.contract.call(
+            "delegates",
+            nativeToScVal(account, { type: "address" })
+          )
+        )
+        .setTimeout(30)
+        .build()
+    );
+
+    if (SorobanRpc.Api.isSimulationError(result)) return null;
+    const raw = (result as SorobanRpc.Api.SimulateTransactionSuccessResponse)
+      .result?.retval;
+    return raw ? (scValToNative(raw) as string) : null;
+  }
+}
