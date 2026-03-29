@@ -1187,7 +1187,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "UnauthorizedCancel")]
+    #[should_panic(expected = "Error(Contract, #1)")]
     fn test_cancel_proposer_active_unauthorized() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1237,7 +1237,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "UnauthorizedCancel")]
+    #[should_panic(expected = "Error(Contract, #1)")]
     fn test_cancel_guardian_pending_unauthorized() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1259,6 +1259,7 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
     fn test_vote_type_simple_rejects_abstain() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1349,7 +1350,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "ProposalExpired")]
+    #[should_panic(expected = "Error(Contract, #3)")]
     fn test_queue_expired_proposal_fails() {
         let env = Env::default();
         env.mock_all_auths();
