@@ -109,5 +109,4 @@ jobs:
         with:
           working_directory: .
           fail_on_error: false
-          scout_extra_args: "--output-format sarif"
 
