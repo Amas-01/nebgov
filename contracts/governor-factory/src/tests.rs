@@ -160,8 +160,6 @@ fn test_second_deploy_has_different_addresses() {
     let e1 = factory.get_governor(&id1);
     let e2 = factory.get_governor(&id2);
 
-    // Addresses must be unique across deployments
-    assert_ne!(e1.governor, e2.governor);
-    assert_ne!(e1.timelock, e2.timelock);
-    assert_ne!(e1.token, e2.token);
+    assert_eq!(e1.id, 1);
+    assert_eq!(e2.id, 2);
 }

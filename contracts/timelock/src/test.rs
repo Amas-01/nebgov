@@ -549,7 +549,7 @@ fn test_execution_deadline() {
 }
 
 #[test]
-#[should_panic(expected = "OperationExpired")]
+#[should_panic(expected = "Error(Contract, #3)")]
 /// Test that execution fails after deadline.
 fn test_execute_after_deadline_fails() {
     let env = Env::default();
