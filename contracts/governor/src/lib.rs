@@ -894,8 +894,8 @@ impl GovernorContract {
         env.storage()
             .instance()
             .set(&DataKey::MinQuorumUsd, &new_settings.min_quorum_usd);
-        match new_settings.reflector_oracle {
-            Some(ref addr) => env
+        match &new_settings.reflector_oracle {
+            Some(addr) => env
                 .storage()
                 .instance()
                 .set(&DataKey::ReflectorOracle, addr),
