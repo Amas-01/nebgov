@@ -1,9 +1,8 @@
 use crate::*;
 use soroban_sdk::{
-    contract, contractimpl, testutils::Address as _, testutils::Ledger as _, Address, Bytes, Env,
-    String, Symbol,
+    contract, contractimpl, testutils::Address as _, testutils::Events, testutils::Ledger as _,
+    Address, Bytes, Env, String, Symbol, TryIntoVal,
 };
-use sorogov_timelock::TimelockError;
 
 /// Mock votes contract that returns a high vote count for any address,
 /// allowing propose() to pass the threshold check in tests.
@@ -48,7 +47,8 @@ fn setup() -> (
     let voter = Address::generate(&env);
 
     // voting_delay=10, voting_period=100, quorum_numerator=0, proposal_threshold=0
-    client.initialize(&admin, &votes_token_id, &timelock, &10, &100, &0, &0);
+    let guardian = Address::generate(&env);
+    client.initialize(&admin, &votes_token_id, &timelock, &10, &100, &0, &0, &guardian, &VoteType::Extended, &120_960);
 
     (env, client, admin, proposer, voter)
 }
@@ -75,6 +75,17 @@ fn make_proposal(env: &Env, client: &GovernorContractClient, proposer: &Address)
     let metadata_uri = String::from_str(env, "https://example.com/metadata");
 
     client.propose(proposer, &description, &description_hash, &metadata_uri, &targets, &fn_names, &calldatas)
+}
+
+fn count_topic(env: &Env, topic_name: &str) -> usize {
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| {
+            let first: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(env);
+            first.is_ok() && first.unwrap() == Symbol::new(env, topic_name)
+        })
+        .count()
 }
 
 #[test]
@@ -106,6 +117,11 @@ fn test_defeated_when_no_votes() {
     // end_ledger = 10 + 100 = 110. Advance to 111.
     env.ledger().set_sequence_number(111);
     assert_eq!(client.state(&proposal_id), ProposalState::Defeated);
+    assert_eq!(count_topic(&env, "ProposalExpired"), 1);
+
+    // Re-reading state should not emit duplicate expiry events.
+    assert_eq!(client.state(&proposal_id), ProposalState::Defeated);
+    assert_eq!(count_topic(&env, "ProposalExpired"), 1);
 }
 
 #[test]
@@ -164,6 +180,7 @@ fn test_cancelled_by_proposer() {
 
     client.cancel(&proposer, &proposal_id);
     assert_eq!(client.state(&proposal_id), ProposalState::Cancelled);
+    assert_eq!(count_topic(&env, "ProposalCancelled"), 1);
 }
 
 #[test]
@@ -216,10 +233,11 @@ fn test_proposal_execution_lifecycle() {
     // 4. Queue (Succeeded -> Queued)
     let timelock_id = env.register(sorogov_timelock::TimelockContract, ());
     let timelock_client = sorogov_timelock::TimelockContractClient::new(&env, &timelock_id);
-    timelock_client.initialize(&admin, &client.address, &0); // min_delay = 0
+    timelock_client.initialize(&admin, &client.address, &0, &1_209_600); // min_delay = 0
 
     let votes_token_id = env.register(MockVotesContract, ());
-    client.initialize(&admin, &votes_token_id, &timelock_id, &10, &100, &0, &0);
+    let guardian = Address::generate(&env);
+    client.initialize(&admin, &votes_token_id, &timelock_id, &10, &100, &0, &0, &guardian, &VoteType::Extended, &120_960);
 
     client.queue(&proposal_id);
     assert_eq!(client.state(&proposal_id), ProposalState::Queued);
@@ -273,10 +291,11 @@ fn test_execute_fails_before_timelock_delay() {
     let timelock_id = env.register(sorogov_timelock::TimelockContract, ());
     let timelock_client = sorogov_timelock::TimelockContractClient::new(&env, &timelock_id);
     // Set 1 hour delay
-    timelock_client.initialize(&admin, &client.address, &3600);
+    timelock_client.initialize(&admin, &client.address, &3600, &1_209_600);
 
     let votes_token_id = env.register(MockVotesContract, ());
-    client.initialize(&admin, &votes_token_id, &timelock_id, &10, &100, &0, &0);
+    let guardian = Address::generate(&env);
+    client.initialize(&admin, &votes_token_id, &timelock_id, &10, &100, &0, &0, &guardian, &VoteType::Extended, &120_960);
 
     client.queue(&proposal_id);
 
