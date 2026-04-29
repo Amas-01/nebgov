@@ -9,6 +9,8 @@ import Link from "next/link";
 import { useSearchParams, useRouter } from "next/navigation";
 import { GovernorClient, ProposalState, Network } from "@nebgov/sdk";
 import { ProposalCardSkeleton } from "../components/ui/ProposalCardSkeleton";
+import { useDebounce } from "../hooks/useDebounce";
+
 
 interface ProposalSummary {
   id: bigint;
@@ -30,8 +32,17 @@ const STATE_COLORS: Record<ProposalState, string> = {
   [ProposalState.Expired]: "bg-orange-100 text-orange-700",
 };
 
-const ALL_STATES = Object.values(ProposalState);
-type SortOption = "newest" | "most-votes" | "ending-soon";
+const FILTER_STATES = [
+  ProposalState.Active,
+  ProposalState.Pending,
+  ProposalState.Succeeded,
+  ProposalState.Defeated,
+  ProposalState.Queued,
+  ProposalState.Executed,
+];
+
+type SortOption = "newest" | "oldest" | "most-votes" | "least-votes";
+
 
 const PROPOSALS_PER_PAGE = 10;
 
@@ -52,6 +63,20 @@ function ProposalsPageInner() {
   const [nextCursor, setNextCursor] = useState<number | undefined>();
   const [hasMore, setHasMore] = useState(false);
 
+  const [searchValue, setSearchValue] = useState(search);
+  const debouncedSearch = useDebounce(searchValue, 300);
+
+  useEffect(() => {
+    setSearchValue(search);
+  }, [search]);
+
+  useEffect(() => {
+    if (debouncedSearch !== search) {
+      setParam("q", debouncedSearch);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedSearch]);
+
   function setParam(key: string, value: string, defaultVal = "") {
     const q = new URLSearchParams(searchParams.toString());
     if (value && value !== defaultVal) {
@@ -59,8 +84,13 @@ function ProposalsPageInner() {
     } else {
       q.delete(key);
     }
-    router.replace(`?${q.toString()}`);
+    const queryString = q.toString();
+    const currentQueryString = searchParams.toString();
+    if (queryString !== currentQueryString) {
+      router.push(`?${queryString}`);
+    }
   }
+
 
   const filtered = useMemo(() => {
     let result = proposals;
@@ -74,15 +104,22 @@ function ProposalsPageInner() {
     const sorted = [...result];
     if (sort === "newest") {
       sorted.sort((a, b) => (b.id > a.id ? 1 : b.id < a.id ? -1 : 0));
+    } else if (sort === "oldest") {
+      sorted.sort((a, b) => (a.id > b.id ? 1 : a.id < b.id ? -1 : 0));
     } else if (sort === "most-votes") {
-      sorted.sort((a, b) =>
-        Number(b.votesFor + b.votesAgainst - (a.votesFor + a.votesAgainst)),
-      );
-    } else if (sort === "ending-soon") {
       sorted.sort(
-        (a, b) => (a.endLedger || Infinity) - (b.endLedger || Infinity),
+        (a, b) =>
+          Number(b.votesFor + b.votesAgainst) -
+          Number(a.votesFor + a.votesAgainst),
+      );
+    } else if (sort === "least-votes") {
+      sorted.sort(
+        (a, b) =>
+          Number(a.votesFor + a.votesAgainst) -
+          Number(b.votesFor + b.votesAgainst),
       );
     }
+
     return sorted;
   }, [proposals, stateFilter, search, sort]);
 
@@ -241,8 +278,8 @@ function ProposalsPageInner() {
         <input
           type="search"
           placeholder="Search proposals…"
-          value={search}
-          onChange={(e) => setParam("q", e.target.value)}
+          value={searchValue}
+          onChange={(e) => setSearchValue(e.target.value)}
           className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
           aria-label="Search proposals"
         />
@@ -252,10 +289,12 @@ function ProposalsPageInner() {
           className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
           aria-label="Sort proposals"
         >
-          <option value="newest">Newest first</option>
-          <option value="most-votes">Most votes</option>
-          <option value="ending-soon">Ending soon</option>
+          <option value="newest">Newest</option>
+          <option value="oldest">Oldest</option>
+          <option value="most-votes">Most Votes</option>
+          <option value="least-votes">Least Votes</option>
         </select>
+
       </div>
 
       {/* Status filter tabs */}
@@ -274,7 +313,7 @@ function ProposalsPageInner() {
         >
           All
         </button>
-        {ALL_STATES.map((s) => (
+        {FILTER_STATES.map((s) => (
           <button
             key={s}
             onClick={() => setParam("state", s, "all")}
@@ -287,6 +326,7 @@ function ProposalsPageInner() {
             {s}
           </button>
         ))}
+
       </div>
 
       {/* Error */}
@@ -345,16 +385,17 @@ function ProposalsPageInner() {
       {!loading && !error && proposals.length > 0 && filtered.length === 0 && (
         <div className="text-center py-12">
           <p className="text-gray-500 text-sm">
-            No proposals match your current filters.
+            No proposals match your filters
           </p>
           <button
-            onClick={() => router.replace("?")}
-            className="mt-3 text-indigo-600 text-sm hover:underline"
+            onClick={() => router.push("?")}
+            className="mt-3 text-indigo-600 text-sm hover:underline font-medium"
           >
-            Clear filters
+            Reset filters
           </button>
         </div>
       )}
+
 
       {/* Proposals list */}
       {!loading && !error && filtered.length > 0 && (
