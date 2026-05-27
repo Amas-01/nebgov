@@ -2109,6 +2109,11 @@ impl GovernorContract {
         let proposal = Self::must_get_proposal(&env, proposal_id);
         proposal.op_ids
     }
+
+    /// Get a proposal by ID.
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
+        Self::must_get_proposal(&env, proposal_id)
+    }
 }
 
 #[cfg(test)]
@@ -3235,13 +3240,6 @@ mod test {
         let proposal = client.get_proposal(&proposal_id);
         assert_eq!(proposal.votes_for, 1_000_000);
         assert!(!proposal.executed);
-    }
-}
-
-#[contractimpl]
-impl GovernorContract {
-    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
-        Self::must_get_proposal(&env, proposal_id)
     }
 }
 
