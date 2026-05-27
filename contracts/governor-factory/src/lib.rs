@@ -256,7 +256,10 @@ impl GovernorFactoryContract {
             .set(&DataKey::Governor(id), &entry);
         env.storage().instance().set(&DataKey::GovernorCount, &id);
 
-        env.events().publish((symbol_short!("deploy"),), id);
+        env.events().publish(
+            (symbol_short!("deploy"),),
+            (id, governor_addr, timelock_addr, token_votes_addr, deployer),
+        );
 
         id
     }

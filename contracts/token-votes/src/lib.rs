@@ -292,6 +292,9 @@ impl TokenVotesContract {
 
     /// Get voting power at a past ledger sequence (snapshot).
     pub fn get_past_votes(env: Env, account: Address, ledger: u32) -> i128 {
+        let current_ledger = env.ledger().sequence();
+        assert!(ledger <= current_ledger, "ledger must not exceed current ledger");
+
         let checkpoints: soroban_sdk::Vec<Checkpoint> = env
             .storage()
             .persistent()
@@ -1126,6 +1129,29 @@ mod tests {
         assert_eq!(client.get_past_votes(&user1, &15), 1500);
         assert_eq!(client.get_past_votes(&user1, &20), 1300);
         assert_eq!(client.get_past_votes(&user1, &100), 1300);
+    }
+
+    #[test]
+    #[should_panic(expected = "ledger must not exceed current ledger")]
+    fn test_get_past_votes_panics_on_future_ledger() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let user1 = Address::generate(&env);
+
+        let (contract_id, token_addr) = setup(&env, &admin);
+        let client = TokenVotesContractClient::new(&env, &contract_id);
+        let sac_client = token::StellarAssetClient::new(&env, &token_addr);
+
+        sac_client.mint(&user1, &1000i128);
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 1;
+        });
+        client.delegate(&user1, &user1);
+
+        let current_ledger = env.ledger().sequence();
+        client.get_past_votes(&user1, &(current_ledger + 1));
     }
 
     // \u2014\u2014 Edge-case tests (issue #192) \u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014

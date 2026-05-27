@@ -6,6 +6,7 @@ import { validate } from "../middleware/validate";
 import { isAdmin } from "../middleware/admin";
 import { Competition } from "../entities/Competition";
 import { CompetitionParticipant } from "../entities/CompetitionParticipant";
+import { logger } from "../logger";
 
 const router = Router();
 
@@ -145,7 +146,7 @@ router.get(
         offset,
       });
     } catch (error) {
-      console.error("Error fetching competitions:", error);
+      logger.error({ err: error }, "Error fetching competitions");
       res.status(500).json({ error: "Failed to fetch competitions" });
     }
   },
@@ -185,7 +186,7 @@ router.get(
 
       res.json(response);
     } catch (error) {
-      console.error("Error fetching competition:", error);
+      logger.error({ err: error }, "Error fetching competition");
       res.status(500).json({ error: "Failed to fetch competition" });
     }
   },
@@ -238,7 +239,7 @@ router.get(
         offset,
       });
     } catch (error) {
-      console.error("Error fetching participants:", error);
+      logger.error({ err: error }, "Error fetching participants");
       res.status(500).json({ error: "Failed to fetch participants" });
     }
   },
@@ -309,7 +310,7 @@ router.post(
       });
     } catch (error) {
       await client.query("ROLLBACK");
-      console.error("Error joining competition:", error);
+      logger.error({ err: error }, "Error joining competition");
       res.status(500).json({ error: "Failed to join competition" });
     } finally {
       client.release();
@@ -377,7 +378,7 @@ router.delete(
       });
     } catch (error) {
       await client.query("ROLLBACK");
-      console.error("Error leaving competition:", error);
+      logger.error({ err: error }, "Error leaving competition");
       res.status(500).json({ error: "Failed to leave competition" });
     } finally {
       client.release();
@@ -405,7 +406,7 @@ router.post(
 
       return res.status(201).json({ competition: result.rows[0] });
     } catch (error) {
-      console.error("Error creating competition:", error);
+      logger.error({ err: error }, "Error creating competition");
       return res.status(500).json({ error: "Failed to create competition" });
     }
   },
@@ -464,7 +465,7 @@ router.put(
 
       return res.status(200).json({ competition: result.rows[0] });
     } catch (error) {
-      console.error("Error updating competition:", error);
+      logger.error({ err: error }, "Error updating competition");
       return res.status(500).json({ error: "Failed to update competition" });
     }
   },
@@ -506,7 +507,7 @@ router.delete(
 
       return res.status(204).send();
     } catch (error) {
-      console.error("Error deleting competition:", error);
+      logger.error({ err: error }, "Error deleting competition");
       return res.status(500).json({ error: "Failed to delete competition" });
     }
   },
