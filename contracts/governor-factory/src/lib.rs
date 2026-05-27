@@ -274,7 +274,7 @@ impl GovernorFactoryContract {
             governor: governor_addr,
             timelock: timelock_addr,
             token: token_votes_addr,
-            deployer,
+            deployer: deployer.clone(),
         };
 
         env.storage()
