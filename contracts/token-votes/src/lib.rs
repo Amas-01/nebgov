@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn test_delegation_emits_events() {
-        use soroban_sdk::{testutils::Events as _, TryIntoVal as _};
+        use soroban_sdk::TryIntoVal as _;
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1075,8 +1075,12 @@ mod tests {
         client.delegate(&delegator, &delegatee);
 
         let events = env.events().all();
-        let sub_events: soroban_sdk::Vec<_> =
-            events.iter().filter(|e| e.0 == contract_id).collect();
+        let mut sub_events: soroban_sdk::Vec<_> = soroban_sdk::Vec::new(&env);
+        for event in events.iter() {
+            if event.0 == contract_id {
+                sub_events.push_back(event.clone());
+            }
+        }
         assert!(sub_events.len() >= 2);
 
         // The last contract event must be the canonical DelegateChanged event

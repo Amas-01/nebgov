@@ -44,13 +44,8 @@ pub enum GovernorError {
     VotesTokenNotSet = 25,
     PauserNotSet = 26,
     ArithmeticOverflow = 27,
-    /// Proposal contains more calldata entries than the on-chain maximum.
-    ///
-    /// Even when every individual calldata entry is within `MaxCalldataSize`,
-    /// a proposal with thousands of tiny entries can exhaust the Soroban
-    /// compute budget during `execute()`.  This error is returned by
-    /// `propose()` when `calldata.len() > MAX_CALLDATA_COUNT`.
-    TooManyCalldataEntries = 28,
+    VotePeriodTooShort = 28,
+    ExecutionWindowZero = 29,
 }
 
 /// Cross-contract interface for the Timelock contract.
@@ -347,11 +342,6 @@ impl GovernorContract {
         let current = env.ledger().sequence();
         
         // Get configuration from storage
-        let voting_period: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::VotingPeriod)
-            .unwrap_or(1000);
         let grace_period: u32 = env
             .storage()
             .instance()
@@ -375,11 +365,7 @@ impl GovernorContract {
         };
         
         // Calculate remaining ledgers until proposal end
-        let ledgers_until_end = if current < proposal.end_ledger {
-            proposal.end_ledger - current
-        } else {
-            0
-        };
+        let ledgers_until_end = proposal.end_ledger.saturating_sub(current);
         
         // Total TTL: remaining voting period + grace period + timelock operations + buffer
         // The buffer ensures we don't expire even if timing is tight
@@ -391,7 +377,7 @@ impl GovernorContract {
         // Extend the TTL for the proposal storage entry
         env.storage()
             .persistent()
-            .extend_ttl(&DataKey::Proposal(proposal_id), ttl_ledgers);
+            .extend_ttl(&DataKey::Proposal(proposal_id), ttl_ledgers, ttl_ledgers);
     }
 
     fn decode_calldata_args(env: &Env, data: &Bytes) -> Vec<Val> {
@@ -446,6 +432,20 @@ impl GovernorContract {
         proposal_grace_period: u32,
     ) {
         admin.require_auth();
+        if voting_period == 0 {
+            env.panic_with_error(GovernorError::VotePeriodTooShort);
+        }
+        let timelock_client = TimelockClient::new(&env, &timelock);
+        let execution_window = timelock_client.execution_window();
+        if execution_window == 0 {
+            env.panic_with_error(GovernorError::ExecutionWindowZero);
+        }
+        // timelock_delay + execution_window must not overflow u64
+        let _ = timelock_client
+            .min_delay()
+            .checked_add(execution_window)
+            .unwrap_or_else(|| env.panic_with_error(GovernorError::ArithmeticOverflow));
+
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
@@ -2129,6 +2129,11 @@ impl GovernorContract {
     pub fn get_queued_op_ids(env: Env, proposal_id: u64) -> Vec<Bytes> {
         let proposal = Self::must_get_proposal(&env, proposal_id);
         proposal.op_ids
+    }
+
+    /// Get a proposal by ID.
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
+        Self::must_get_proposal(&env, proposal_id)
     }
 }
 
