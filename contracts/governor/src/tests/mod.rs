@@ -14,6 +14,34 @@ use soroban_sdk::{
     Address, BytesN, Env, IntoVal, Symbol, TryIntoVal,
 };
 
+#[contract]
+pub struct MockTimelockContract;
+
+#[contractimpl]
+impl MockTimelockContract {
+    pub fn min_delay(_env: Env) -> u64 {
+        1
+    }
+
+    pub fn execution_window(_env: Env) -> u64 {
+        60
+    }
+}
+
+#[contract]
+pub struct MockTimelockZeroWindowContract;
+
+#[contractimpl]
+impl MockTimelockZeroWindowContract {
+    pub fn min_delay(_env: Env) -> u64 {
+        1
+    }
+
+    pub fn execution_window(_env: Env) -> u64 {
+        0
+    }
+}
+
 #[allow(dead_code)]
 fn count_topic(env: &Env, topic_name: &str) -> usize {
     let topic_symbol = Symbol::new(env, topic_name);
@@ -86,7 +114,7 @@ fn upgrade_rejects_admin_acting_as_direct_caller() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let votes_token = Address::generate(&env);
-    let timelock = Address::generate(&env);
+    let timelock = env.register(MockTimelockContract, ());
     let contract_id = env.register(GovernorContract, ());
 
     env.mock_all_auths();
@@ -166,7 +194,7 @@ fn update_config_succeeds_with_contract_self_auth() {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let votes_token = Address::generate(&env);
-    let timelock = Address::generate(&env);
+    let timelock = env.register(MockTimelockContract, ());
     let contract_id = env.register(GovernorContract, ());
     let client = GovernorContractClient::new(&env, &contract_id);
 
@@ -223,7 +251,7 @@ fn update_config_rejects_excessive_voting_delay() {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let votes_token = Address::generate(&env);
-    let timelock = Address::generate(&env);
+    let timelock = env.register(MockTimelockContract, ());
     let contract_id = env.register(GovernorContract, ());
     let client = GovernorContractClient::new(&env, &contract_id);
     let guardian = Address::generate(&env);
@@ -254,7 +282,7 @@ fn update_config_rejects_short_voting_period() {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let votes_token = Address::generate(&env);
-    let timelock = Address::generate(&env);
+    let timelock = env.register(MockTimelockContract, ());
     let contract_id = env.register(GovernorContract, ());
     let client = GovernorContractClient::new(&env, &contract_id);
     let guardian = Address::generate(&env);
@@ -285,7 +313,7 @@ fn update_config_rejects_invalid_quorum_numerator() {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let votes_token = Address::generate(&env);
-    let timelock = Address::generate(&env);
+    let timelock = env.register(MockTimelockContract, ());
     let contract_id = env.register(GovernorContract, ());
     let client = GovernorContractClient::new(&env, &contract_id);
     let guardian = Address::generate(&env);
@@ -316,7 +344,7 @@ fn update_config_rejects_negative_proposal_threshold() {
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let votes_token = Address::generate(&env);
-    let timelock = Address::generate(&env);
+    let timelock = env.register(MockTimelockContract, ());
     let contract_id = env.register(GovernorContract, ());
     let client = GovernorContractClient::new(&env, &contract_id);
     let guardian = Address::generate(&env);
@@ -338,6 +366,58 @@ fn update_config_rejects_negative_proposal_threshold() {
     settings.proposal_threshold = -1;
 
     client.update_config(&settings);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn initialize_rejects_zero_voting_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let votes_token = Address::generate(&env);
+    let timelock = env.register(MockTimelockContract, ());
+    let contract_id = env.register(GovernorContract, ());
+    let client = GovernorContractClient::new(&env, &contract_id);
+    let guardian = Address::generate(&env);
+
+    client.initialize(
+        &admin,
+        &votes_token,
+        &timelock,
+        &100u32,
+        &0u32,
+        &4u32,
+        &0i128,
+        &guardian,
+        &VoteType::Extended,
+        &120_960u32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn initialize_rejects_zero_execution_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let votes_token = Address::generate(&env);
+    let timelock = env.register(MockTimelockZeroWindowContract, ());
+    let contract_id = env.register(GovernorContract, ());
+    let client = GovernorContractClient::new(&env, &contract_id);
+    let guardian = Address::generate(&env);
+
+    client.initialize(
+        &admin,
+        &votes_token,
+        &timelock,
+        &100u32,
+        &1000u32,
+        &4u32,
+        &0i128,
+        &guardian,
+        &VoteType::Extended,
+        &120_960u32,
+    );
 }
 
 #[test]

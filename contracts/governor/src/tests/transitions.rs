@@ -27,6 +27,20 @@ impl MockVotesContract {
     }
 }
 
+#[contract]
+pub struct MockTimelockContract;
+
+#[contractimpl]
+impl MockTimelockContract {
+    pub fn min_delay(_env: Env) -> u64 {
+        1
+    }
+
+    pub fn execution_window(_env: Env) -> u64 {
+        60
+    }
+}
+
 /// Shared helper: initialize the governor with standard test parameters.
 fn setup() -> (
     Env,
@@ -42,7 +56,7 @@ fn setup() -> (
 
     let admin = Address::generate(&env);
     let votes_token_id = env.register(MockVotesContract, ());
-    let timelock = Address::generate(&env);
+    let timelock = env.register(MockTimelockContract, ());
     let proposer = Address::generate(&env);
     let voter = Address::generate(&env);
 

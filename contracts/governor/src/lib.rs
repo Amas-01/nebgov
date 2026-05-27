@@ -41,6 +41,8 @@ pub enum GovernorError {
     VotesTokenNotSet = 25,
     PauserNotSet = 26,
     ArithmeticOverflow = 27,
+    VotePeriodTooShort = 28,
+    ExecutionWindowZero = 29,
 }
 
 /// Cross-contract interface for the Timelock contract.
@@ -436,6 +438,20 @@ impl GovernorContract {
         proposal_grace_period: u32,
     ) {
         admin.require_auth();
+        if voting_period == 0 {
+            env.panic_with_error(GovernorError::VotePeriodTooShort);
+        }
+        let timelock_client = TimelockClient::new(&env, &timelock);
+        let execution_window = timelock_client.execution_window();
+        if execution_window == 0 {
+            env.panic_with_error(GovernorError::ExecutionWindowZero);
+        }
+        // timelock_delay + execution_window must not overflow u64
+        let _ = timelock_client
+            .min_delay()
+            .checked_add(execution_window)
+            .unwrap_or_else(|| env.panic_with_error(GovernorError::ArithmeticOverflow));
+
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
