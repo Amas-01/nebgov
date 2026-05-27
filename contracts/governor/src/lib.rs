@@ -450,16 +450,6 @@ impl GovernorContract {
     ) -> u64 {
         proposer.require_auth();
 
-        // Check if contract is paused
-        let is_paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::IsPaused)
-            .unwrap_or(false);
-        if is_paused {
-            env.panic_with_error(GovernorError::ContractPaused);
-        }
-
         // Validate all vectors have the same length
         if !(targets.len() == fn_names.len() && targets.len() == calldatas.len()) {
             env.panic_with_error(GovernorError::InvalidVectorLengths);
@@ -665,16 +655,6 @@ impl GovernorContract {
     pub fn cast_vote(env: Env, voter: Address, proposal_id: u64, support: VoteSupport) {
         voter.require_auth();
 
-        // Check if contract is paused
-        let is_paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::IsPaused)
-            .unwrap_or(false);
-        if is_paused {
-            env.panic_with_error(GovernorError::ContractPaused);
-        }
-
         // Validate vote support against configured vote type
         Self::validate_vote_support(&env, &support).unwrap_or_else(|e| env.panic_with_error(e));
 
@@ -812,16 +792,6 @@ impl GovernorContract {
     ///
     /// Schedules every action in the proposal via the Timelock contract.
     pub fn queue(env: Env, proposal_id: u64) {
-        // Check if contract is paused
-        let is_paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::IsPaused)
-            .unwrap_or(false);
-        if is_paused {
-            env.panic_with_error(GovernorError::ContractPaused);
-        }
-
         let proposal_state = Self::state(env.clone(), proposal_id);
 
         if proposal_state == ProposalState::Expired {
@@ -907,16 +877,6 @@ impl GovernorContract {
     /// Delegates to the timelock to enforce the delay, which in turn invokes
     /// `proposal.fn_name()` on `proposal.target`.
     pub fn execute(env: Env, proposal_id: u64) {
-        // Check if contract is paused
-        let is_paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::IsPaused)
-            .unwrap_or(false);
-        if is_paused {
-            env.panic_with_error(GovernorError::ContractPaused);
-        }
-
         if Self::state(env.clone(), proposal_id) != ProposalState::Queued {
             env.panic_with_error(GovernorError::ProposalNotQueued);
         }
@@ -1972,9 +1932,19 @@ impl GovernorContract {
     }
 
     /// Unpause the contract to resume normal operations.
-    /// Only callable via governance proposal (requires contract self-auth).
-    pub fn unpause(env: Env) {
-        env.current_contract_address().require_auth();
+    /// Callable by the designated pauser address (same as pause()).
+    pub fn unpause(env: Env, caller: Address) {
+        caller.require_auth();
+
+        let pauser: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Pauser)
+            .unwrap_or_else(|| env.panic_with_error(GovernorError::PauserNotSet));
+
+        if caller != pauser {
+            env.panic_with_error(GovernorError::UnauthorizedPause);
+        }
 
         env.storage().instance().set(&DataKey::IsPaused, &false);
 
