@@ -314,19 +314,37 @@ function ProposeWizardInner() {
       return;
     }
 
-    const pinataKey = localStorage.getItem("pinata_jwt") || "";
+    // Try to get JWT from sessionStorage (only for current session, cleared on tab close)
+    let pinataKey = sessionStorage.getItem("pinata_jwt") || "";
     if (!pinataKey) {
       const key = prompt("Please enter your Pinata JWT (or API Key):");
       if (!key) return;
-      localStorage.setItem("pinata_jwt", key);
+      // Store only in sessionStorage (cleared on browser tab close) - NEVER in localStorage
+      sessionStorage.setItem("pinata_jwt", key);
+      pinataKey = key;
     }
 
     setIsUploading(true);
     setStepErrors([]);
     try {
-      const { uri, hash } = await uploadProposalMetadata(draft.description, {
-        pinataApiKey: localStorage.getItem("pinata_jwt") || "",
+      // Call the server-side API route that handles Pinata uploads securely
+      const response = await fetch("/api/upload-metadata", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          description: draft.description,
+          pinataJwt: pinataKey,
+        }),
       });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || `Upload failed: ${response.status}`);
+      }
+
+      const { uri, hash } = await response.json();
       setDraft((d) => ({ ...d, ipfsRef: uri, descriptionHash: hash }));
     } catch (err) {
       console.error("IPFS upload failed:", err);
