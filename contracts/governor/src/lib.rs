@@ -323,6 +323,15 @@ pub struct GovernorContract;
 
 #[contractimpl]
 impl GovernorContract {
+    /// Approximate number of seconds per Soroban ledger close.
+    ///
+    /// Used to convert timelock delay/window values (in seconds) to ledger
+    /// counts. Stellar Mainnet closes ledgers roughly every 5 seconds; this
+    /// constant must be kept consistent across all conversion sites in this
+    /// file so that TTL extensions and veto-window calculations use the same
+    /// baseline.
+    const SECONDS_PER_LEDGER: u64 = 5;
+
     fn must_get_proposal(env: &Env, proposal_id: u64) -> Proposal {
         env.storage()
             .persistent()
@@ -359,8 +368,8 @@ impl GovernorContract {
             let timelock = TimelockClient::new(env, &addr);
             let delay_seconds = timelock.min_delay();
             let execution_window_seconds = timelock.execution_window();
-            // Convert seconds to ledgers (assuming ~5 second blocks)
-            ((delay_seconds + execution_window_seconds) / 5) as u32
+            // Convert seconds to ledgers using the shared constant.
+            ((delay_seconds + execution_window_seconds) / Self::SECONDS_PER_LEDGER) as u32
         } else {
             1000 // conservative default
         };
@@ -1248,12 +1257,12 @@ impl GovernorContract {
         let timelock = TimelockClient::new(&env, &timelock_addr);
         let delay = timelock.min_delay();
 
-        // Check if we're still in the veto window
+        // Check if we're still in the veto window.
+        // `delay` is in seconds; convert to ledgers using the shared constant so this
+        // site matches extend_proposal_ttl (previously used /10, which halved the window).
         let current_ledger = env.ledger().sequence();
-        // For simplicity, use delay directly as ledger count (adjusting for typical Soroban block times)
-        // The veto window should close after timelock_delay seconds
-        // Conversion: assume timelock delay is in seconds and we need ledger conversion
-        let veto_window_end_ledger = queue_time + ((delay / 10) as u32); // Roughly 1 ledger per 10 seconds
+        let delay_ledgers = (delay / Self::SECONDS_PER_LEDGER) as u32;
+        let veto_window_end_ledger = queue_time.saturating_add(delay_ledgers);
 
         if current_ledger >= veto_window_end_ledger {
             env.panic_with_error(GovernorError::VetoWindowClosed);

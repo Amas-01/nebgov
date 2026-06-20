@@ -1661,3 +1661,113 @@ fn test_set_pauser_requires_self_auth() {
 
     governor_client.set_pauser(&new_pauser);
 }
+
+/// Regression test for issue #600: cancel_queued used /10 instead of /5 to
+/// convert the timelock delay (seconds) to ledgers, halving the guardian's
+/// veto window.
+///
+/// With `min_delay = 100` seconds:
+///   - Buggy window end  = queue_ledger + (100 / 10) = queue_ledger + 10
+///   - Correct window end = queue_ledger + (100 /  5) = queue_ledger + 20
+///
+/// This test advances 11 ledgers past the queue point — past the old (wrong)
+/// boundary but still inside the correct window — and asserts that the
+/// guardian can successfully cancel.  With the bug present the call panics
+/// with `VetoWindowClosed`.
+#[test]
+fn test_cancel_queued_veto_window_uses_correct_conversion_factor() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_addr = sac.address();
+    let token_admin = token::StellarAssetClient::new(&env, &token_addr);
+
+    let votes_id = env.register(TokenVotesContract, ());
+    let votes_client = TokenVotesContractClient::new(&env, &votes_id);
+    votes_client.initialize(&admin, &token_addr);
+
+    let mock_target_id = env.register(MockTarget, ());
+
+    let timelock_id = env.register(TimelockContract, ());
+    let governor_id = env.register(GovernorContract, ());
+
+    let timelock_client = TimelockContractClient::new(&env, &timelock_id);
+    let governor_client = GovernorContractClient::new(&env, &governor_id);
+
+    // 100-second min_delay → 20-ledger veto window (100 / 5), not 10 (100 / 10).
+    let min_delay: u64 = 100;
+    timelock_client.initialize(&admin, &governor_id, &min_delay, &1_209_600);
+
+    let guardian = Address::generate(&env);
+    governor_client.initialize(
+        &admin,
+        &votes_id,
+        &timelock_id,
+        &10_u32,
+        &20_u32,
+        &0_u32,
+        &0_i128,
+        &guardian,
+        &VoteType::Extended,
+        &120_960u32,
+    );
+
+    let alice = Address::generate(&env);
+    token_admin.mint(&alice, &500_i128);
+    votes_client.delegate(&alice, &alice);
+
+    let proposer = Address::generate(&env);
+    let fn_name = Symbol::new(&env, "exec_gov");
+    let calldata = Bytes::new(&env);
+    let description = soroban_sdk::String::from_str(&env, "Regression #600");
+    let description_hash = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, b"Regression #600"))
+        .into();
+    let metadata_uri = soroban_sdk::String::from_str(&env, "ipfs://regression-600");
+
+    let mut targets = soroban_sdk::Vec::new(&env);
+    targets.push_back(mock_target_id.clone());
+    let mut fn_names = soroban_sdk::Vec::new(&env);
+    fn_names.push_back(fn_name);
+    let mut calldatas = soroban_sdk::Vec::new(&env);
+    calldatas.push_back(calldata);
+
+    let proposal_id = governor_client.propose(
+        &proposer,
+        &description,
+        &description_hash,
+        &metadata_uri,
+        &targets,
+        &fn_names,
+        &calldatas,
+    );
+
+    // Advance into voting, cast a winning vote, then past end_ledger.
+    env.ledger().with_mut(|l| l.sequence_number = 11);
+    governor_client.cast_vote(&alice, &proposal_id, &VoteSupport::For);
+
+    env.ledger().with_mut(|l| l.sequence_number = 31);
+    assert_eq!(governor_client.state(&proposal_id), ProposalState::Succeeded);
+
+    // Record the ledger at queue time; advance 11 ledgers (old buggy boundary +1).
+    let queue_ledger = env.ledger().sequence();
+    governor_client.queue(&proposal_id);
+    assert_eq!(governor_client.state(&proposal_id), ProposalState::Queued);
+
+    // 11 ledgers past queue point: old code (/ 10) thinks window closed at +10,
+    // correct code (/ 5) knows window closes at +20.
+    env.ledger()
+        .with_mut(|l| l.sequence_number = queue_ledger + 11);
+
+    // Must succeed — we are still inside the correct veto window.
+    governor_client.cancel_queued(&guardian, &proposal_id);
+
+    assert_eq!(
+        governor_client.state(&proposal_id),
+        ProposalState::Cancelled,
+        "proposal must be Cancelled: guardian is still within the veto window at ledger +11"
+    );
+}
