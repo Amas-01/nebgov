@@ -82,7 +82,7 @@ fn setup_liquidity() -> (Env, Address, Address, Address, Address, Address, Addre
 
 #[test]
 fn test_initialize_sets_governor() {
-    let (env, contract_id, governor, _, _, token_a, token_b) = setup_liquidity();
+    let (env, contract_id, governor, _, _, _token_a, _token_b) = setup_liquidity();
     let client = LiquidityContractClient::new(&env, &contract_id);
     assert_eq!(client.governor(), governor);
 }
@@ -105,7 +105,7 @@ fn test_add_liquidity_creates_pool_and_position() {
 
 #[test]
 fn test_get_lp_position_defaults_to_zero() {
-    let (env, contract_id, _, _, _, token_a, token_b) = setup_liquidity();
+    let (env, contract_id, _, _, _, _token_a, _token_b) = setup_liquidity();
     let client = LiquidityContractClient::new(&env, &contract_id);
     let unknown_provider = Address::generate(&env);
     assert_eq!(client.get_lp_position(&unknown_provider, &0, &1), 0);
@@ -201,6 +201,11 @@ fn test_governor_proposal_executes_liquidity_fee_update() {
     votes_client.set_votes(&proposer, &500);
     votes_client.set_votes(&voter, &500);
     votes_client.set_total_supply(&1_000);
+
+    let token_a = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_b = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token_a).mint(&provider, &1_000_000);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token_b).mint(&provider, &1_000_000);
 
     let liquidity_id = env.register(LiquidityContract, ());
     let liquidity_client = LiquidityContractClient::new(&env, &liquidity_id);

@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 
 //! Protocol-owned liquidity management for NebGov markets.
 //!
