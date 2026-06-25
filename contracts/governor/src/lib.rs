@@ -2186,10 +2186,7 @@ impl GovernorContract {
 
         env.storage().instance().set(&DataKey::Pauser, &new_pauser);
 
-        env.events().publish(
-            (Symbol::new(&env, "PauserChanged"),),
-            (old_pauser, new_pauser),
-        );
+        events::emit_pauser_changed(&env, &old_pauser, &new_pauser);
     }
 
     // ============================================================================

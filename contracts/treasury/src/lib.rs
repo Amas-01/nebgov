@@ -31,6 +31,9 @@ pub struct TxProposal {
     pub approvals: u32,
     pub executed: bool,
     pub cancelled: bool,
+    /// Amount reserved from daily limit (if submitted via submit_with_limit).
+    /// None for regular submit() calls.
+    pub reserved_daily_amount: Option<i128>,
 }
 
 /// A single recipient in a batch transfer.
@@ -229,6 +232,7 @@ impl TreasuryContract {
             approvals: 0,
             executed: false,
             cancelled: false,
+            reserved_daily_amount: None,
         };
 
         env.storage().persistent().set(&DataKey::Tx(id), &tx);
@@ -314,8 +318,31 @@ impl TreasuryContract {
             .instance()
             .set(&DataKey::DailySpent, &new_daily_total);
 
-        // Proceed with standard proposal submission logic.
-        Self::submit_internal(env, proposer, target, symbol_short!("transfer"), data)
+        // Create proposal with reserved amount tracking
+        Self::require_not_executing(&env);
+        Self::require_owner(&env, &proposer);
+
+        let count: u64 = env.storage().instance().get(&DataKey::TxCount).unwrap_or(0);
+        let id = count + 1;
+
+        let tx = TxProposal {
+            id,
+            proposer,
+            target,
+            fn_name: symbol_short!("transfer"),
+            data,
+            created_ledger: env.ledger().sequence(),
+            approvals: 0,
+            executed: false,
+            cancelled: false,
+            reserved_daily_amount: Some(amount),
+        };
+
+        env.storage().persistent().set(&DataKey::Tx(id), &tx);
+        env.storage().instance().set(&DataKey::TxCount, &id);
+        env.events().publish((symbol_short!("submit"),), id);
+
+        id
     }
 
     /// Approve a pending transaction. Executes automatically when threshold reached.
@@ -387,6 +414,18 @@ impl TreasuryContract {
             .get(&DataKey::Tx(tx_id))
             .expect("tx not found");
         assert!(!tx.executed && !tx.cancelled, "invalid state");
+        
+        // If this proposal had a reserved daily amount, refund it
+        if let Some(reserved) = tx.reserved_daily_amount {
+            let spent: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::DailySpent)
+                .unwrap_or(0i128);
+            let new_spent = spent.saturating_sub(reserved);
+            env.storage().instance().set(&DataKey::DailySpent, &new_spent);
+        }
+        
         tx.cancelled = true;
         env.storage().persistent().set(&DataKey::Tx(tx_id), &tx);
         env.events().publish((symbol_short!("cancel"),), tx_id);
