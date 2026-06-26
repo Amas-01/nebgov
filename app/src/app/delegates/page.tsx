@@ -20,6 +20,9 @@ function DelegateSkeleton() {
         <Skeleton className="h-4 w-20" />
       </td>
       <td className="py-4 px-4">
+        <Skeleton className="h-4 w-12" />
+      </td>
+      <td className="py-4 px-4">
         <Skeleton className="h-2 w-full" />
       </td>
       <td className="py-4 px-4">
@@ -170,6 +173,9 @@ export default function DelegatesPage() {
                 Votes
               </th>
               <th className="py-3 px-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                Delegators
+              </th>
+              <th className="py-3 px-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                 % of Supply
               </th>
               <th className="py-3 px-4 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -188,7 +194,7 @@ export default function DelegatesPage() {
 
             {!loading && delegates.length === 0 && !error && (
               <tr>
-                <td colSpan={5} className="py-12 text-center text-gray-500">
+                <td colSpan={6} className="py-12 text-center text-gray-500">
                   No delegates found. Be the first to delegate!
                 </td>
               </tr>
@@ -214,9 +220,12 @@ export default function DelegatesPage() {
                     </td>
                     <td className="py-4 px-4">
                       <div className="flex items-center gap-2">
-                        <span className="font-mono text-sm text-gray-900">
+                        <Link
+                          href={`/profile/${delegate.address}`}
+                          className="font-mono text-sm text-indigo-600 hover:text-indigo-800 hover:underline"
+                        >
                           {formatAddress(delegate.address)}
-                        </span>
+                        </Link>
                         {isCurrentUser && (
                           <span className="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded">
                             You
@@ -226,6 +235,9 @@ export default function DelegatesPage() {
                     </td>
                     <td className="py-4 px-4 text-sm font-medium text-gray-900">
                       {formatVotes(delegate.votingPower)}
+                    </td>
+                    <td className="py-4 px-4 text-sm text-gray-600">
+                      {delegate.delegatorCount.toLocaleString()}
                     </td>
                     <td className="py-4 px-4">
                       <div className="flex items-center gap-2">
@@ -265,6 +277,7 @@ export default function DelegatesPage() {
         open={modalOpen}
         onClose={() => setModalOpen(false)}
         onDelegated={() => window.location.reload()}
+        prefillAddress={prefillAddress}
         currentDelegatee={currentDelegatee}
       />
     </div>
