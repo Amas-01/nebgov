@@ -1,5 +1,5 @@
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
+use soroban_sdk::{testutils::Address as _, token, Address, BytesN, Env};
 
 use sorogov_governor::GovernorContract;
 use sorogov_timelock::TimelockContract;
@@ -120,6 +120,94 @@ fn test_deploy_full_stack() {
     assert_eq!(votes_client.token(), token);
 }
 
+#[test]
+fn test_estimate_deploy_cost_returns_three_contract_reserve() {
+    let env = Env::default();
+    let factory_id = env.register(GovernorFactoryContract, ());
+    let factory = GovernorFactoryContractClient::new(&env, &factory_id);
+
+    assert_eq!(factory.estimate_deploy_cost(), 15_000_000i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_deploy_rejects_insufficient_native_balance_before_deploy() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    env.register(GovernorContract, ());
+    env.register(TimelockContract, ());
+    env.register(TokenVotesContract, ());
+
+    let (governor_hash, timelock_hash, token_votes_hash) = upload_wasms(&env);
+
+    let admin = Address::generate(&env);
+    let deployer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let native_sac = env.register_stellar_asset_contract_v2(admin.clone());
+
+    let factory_id = env.register(GovernorFactoryContract, ());
+    let factory = GovernorFactoryContractClient::new(&env, &factory_id);
+
+    factory.initialize(&admin, &governor_hash, &timelock_hash, &token_votes_hash);
+    factory.set_native_token(&admin, &native_sac.address());
+
+    let guardian = Address::generate(&env);
+    factory.deploy(
+        &deployer,
+        &token,
+        &100u32,
+        &1000u32,
+        &50u32,
+        &0i128,
+        &3600u64,
+        &guardian,
+        &1u32,
+        &120_960u32,
+    );
+}
+
+#[test]
+fn test_deploy_allows_sufficient_native_balance() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    env.register(GovernorContract, ());
+    env.register(TimelockContract, ());
+    env.register(TokenVotesContract, ());
+
+    let (governor_hash, timelock_hash, token_votes_hash) = upload_wasms(&env);
+
+    let admin = Address::generate(&env);
+    let deployer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let native_sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let native_admin = token::StellarAssetClient::new(&env, &native_sac.address());
+
+    let factory_id = env.register(GovernorFactoryContract, ());
+    let factory = GovernorFactoryContractClient::new(&env, &factory_id);
+
+    factory.initialize(&admin, &governor_hash, &timelock_hash, &token_votes_hash);
+    factory.set_native_token(&admin, &native_sac.address());
+    native_admin.mint(&deployer, &factory.estimate_deploy_cost());
+
+    let guardian = Address::generate(&env);
+    let id = factory.deploy(
+        &deployer,
+        &token,
+        &100u32,
+        &1000u32,
+        &50u32,
+        &0i128,
+        &3600u64,
+        &guardian,
+        &1u32,
+        &120_960u32,
+    );
+
+    assert_eq!(id, 1);
+}
+
 // ─── second deploy produces a distinct stack ──────────────────────────────────
 
 #[test]
@@ -176,4 +264,146 @@ fn test_second_deploy_has_different_addresses() {
 
     assert_eq!(e1.id, 1);
     assert_eq!(e2.id, 2);
+}
+
+// ─── settings validation tests (issue #477) ───────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_deploy_rejects_zero_voting_period() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    env.register(GovernorContract, ());
+    env.register(TimelockContract, ());
+    env.register(TokenVotesContract, ());
+
+    let (governor_hash, timelock_hash, token_votes_hash) = upload_wasms(&env);
+
+    let admin = Address::generate(&env);
+    let deployer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let factory_id = env.register(GovernorFactoryContract, ());
+    let factory = GovernorFactoryContractClient::new(&env, &factory_id);
+    factory.initialize(&admin, &governor_hash, &timelock_hash, &token_votes_hash);
+
+    let guardian = Address::generate(&env);
+    factory.deploy(
+        &deployer,
+        &token,
+        &100u32,
+        &0u32, // zero voting_period — must be rejected
+        &50u32,
+        &0i128,
+        &3600u64,
+        &guardian,
+        &1u32,
+        &120_960u32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_deploy_rejects_zero_quorum_numerator() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    env.register(GovernorContract, ());
+    env.register(TimelockContract, ());
+    env.register(TokenVotesContract, ());
+
+    let (governor_hash, timelock_hash, token_votes_hash) = upload_wasms(&env);
+
+    let admin = Address::generate(&env);
+    let deployer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let factory_id = env.register(GovernorFactoryContract, ());
+    let factory = GovernorFactoryContractClient::new(&env, &factory_id);
+    factory.initialize(&admin, &governor_hash, &timelock_hash, &token_votes_hash);
+
+    let guardian = Address::generate(&env);
+    factory.deploy(
+        &deployer,
+        &token,
+        &100u32,
+        &1000u32,
+        &0u32, // zero quorum_numerator — must be rejected
+        &0i128,
+        &3600u64,
+        &guardian,
+        &1u32,
+        &120_960u32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_deploy_rejects_zero_timelock_delay() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    env.register(GovernorContract, ());
+    env.register(TimelockContract, ());
+    env.register(TokenVotesContract, ());
+
+    let (governor_hash, timelock_hash, token_votes_hash) = upload_wasms(&env);
+
+    let admin = Address::generate(&env);
+    let deployer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let factory_id = env.register(GovernorFactoryContract, ());
+    let factory = GovernorFactoryContractClient::new(&env, &factory_id);
+    factory.initialize(&admin, &governor_hash, &timelock_hash, &token_votes_hash);
+
+    let guardian = Address::generate(&env);
+    factory.deploy(
+        &deployer,
+        &token,
+        &100u32,
+        &1000u32,
+        &50u32,
+        &0i128,
+        &0u64, // zero timelock_delay — must be rejected
+        &guardian,
+        &1u32,
+        &120_960u32,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_deploy_rejects_invalid_vote_type() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    env.register(GovernorContract, ());
+    env.register(TimelockContract, ());
+    env.register(TokenVotesContract, ());
+
+    let (governor_hash, timelock_hash, token_votes_hash) = upload_wasms(&env);
+
+    let admin = Address::generate(&env);
+    let deployer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let factory_id = env.register(GovernorFactoryContract, ());
+    let factory = GovernorFactoryContractClient::new(&env, &factory_id);
+    factory.initialize(&admin, &governor_hash, &timelock_hash, &token_votes_hash);
+
+    let guardian = Address::generate(&env);
+    factory.deploy(
+        &deployer,
+        &token,
+        &100u32,
+        &1000u32,
+        &50u32,
+        &0i128,
+        &3600u64,
+        &guardian,
+        &99u32, // invalid vote_type — must be rejected
+        &120_960u32,
+    );
 }

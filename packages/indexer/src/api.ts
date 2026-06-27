@@ -1,4 +1,4 @@
-import express, { Request, Response } from "express";
+import express, { Request, Response, NextFunction } from "express";
 import { SorobanRpc } from "@stellar/stellar-sdk";
 import { pool } from "./db";
 import { cached, getMetrics } from "./cache";
@@ -6,6 +6,107 @@ import { getLastIndexedLedger } from "./events";
 import { startTime } from "./index";
 import swaggerUi from "swagger-ui-express";
 import { generateOpenApiDocument } from "./openapi";
+
+// ---------------------------------------------------------------------------
+// In-process rate limiter (issue #437)
+//
+// Tracks request counts per IP in a sliding window. No external dependency
+// required — the store is a plain Map that is pruned on every request so
+// memory usage stays bounded.
+// ---------------------------------------------------------------------------
+
+interface RateLimitEntry {
+  count: number;
+  windowStart: number;
+}
+
+const rateLimitStore = new Map<string, RateLimitEntry>();
+
+/**
+ * Build an Express middleware that limits each IP to `max` requests within
+ * a rolling `windowMs` millisecond window.
+ *
+ * When the limit is exceeded the middleware responds with HTTP 429 and a
+ * JSON body that includes a `Retry-After` header (seconds until the window
+ * resets) so well-behaved clients can back off automatically.
+ */
+function createRateLimiter(options: {
+  windowMs: number;
+  max: number;
+  message?: string;
+}) {
+  const { windowMs, max, message = "Too many requests, please try again later." } = options;
+
+  return function rateLimitMiddleware(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): void {
+    const ip =
+      (req.headers["x-forwarded-for"] as string | undefined)?.split(",")[0].trim() ??
+      req.socket.remoteAddress ??
+      "unknown";
+
+    const now = Date.now();
+
+    // Prune stale entries to keep the store from growing unboundedly.
+    for (const [key, entry] of rateLimitStore.entries()) {
+      if (now - entry.windowStart > windowMs) {
+        rateLimitStore.delete(key);
+      }
+    }
+
+    const entry = rateLimitStore.get(ip);
+
+    if (!entry || now - entry.windowStart > windowMs) {
+      // First request in this window (or window has expired).
+      rateLimitStore.set(ip, { count: 1, windowStart: now });
+      res.setHeader("X-RateLimit-Limit", max);
+      res.setHeader("X-RateLimit-Remaining", max - 1);
+      res.setHeader("X-RateLimit-Reset", Math.ceil((now + windowMs) / 1000));
+      next();
+      return;
+    }
+
+    entry.count += 1;
+    const remaining = Math.max(0, max - entry.count);
+    const resetAt = Math.ceil((entry.windowStart + windowMs) / 1000);
+
+    res.setHeader("X-RateLimit-Limit", max);
+    res.setHeader("X-RateLimit-Remaining", remaining);
+    res.setHeader("X-RateLimit-Reset", resetAt);
+
+    if (entry.count > max) {
+      const retryAfter = Math.ceil((entry.windowStart + windowMs - now) / 1000);
+      res.setHeader("Retry-After", retryAfter);
+      res.status(429).json({ error: message });
+      return;
+    }
+
+    next();
+  };
+}
+
+/** General-purpose limiter: 100 requests per 15-minute window per IP. */
+const generalLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+});
+
+/**
+ * Stricter limiter for expensive / enumeration-prone endpoints.
+ *
+ * Applied to:
+ *   - GET /delegates  (N+1 query risk)
+ *   - GET /profile/:address  (enumeration attack surface)
+ *
+ * Allows 30 requests per 15-minute window per IP.
+ */
+const strictLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: "Too many requests to this endpoint, please slow down.",
+});
 
 const TTL = {
   proposals: 30_000, // 30 seconds
@@ -141,6 +242,11 @@ export function createApp(server: SorobanRpc.Server): express.Application {
   const app = express();
   app.use(express.json());
 
+  // Apply general rate limiting to all routes (issue #437).
+  // Health and docs endpoints are intentionally included so that monitoring
+  // probes cannot be weaponised to exhaust the database connection pool.
+  app.use(generalLimiter);
+
   // Swagger documentation
   app.get("/openapi.json", (_req, res) => {
     res.setHeader("Content-Type", "application/json");
@@ -229,36 +335,114 @@ export function createApp(server: SorobanRpc.Server): express.Application {
     },
   );
 
-  // GET /proposals?offset=0&limit=20 or ?before=47&limit=20 or ?after=10&limit=20
+  // GET /proposals?offset=0&limit=20
+  //       or ?before=47&limit=20
+  //       or ?after=10&limit=20
+  //       or ?state=Active&current_ledger=5000
+  //       or ?proposer=G...
+  //       or ?page=2&limit=20
   app.get("/proposals", async (req: Request, res: Response): Promise<void> => {
     const limit = Math.min(Number(req.query.limit ?? 20), 100);
     const before = req.query.before ? Number(req.query.before) : undefined;
     const after = req.query.after ? Number(req.query.after) : undefined;
     const offset = Number(req.query.offset ?? 0);
+    const state = req.query.state ? String(req.query.state).trim() : undefined;
+    const proposer = req.query.proposer ? String(req.query.proposer).trim() : undefined;
+    const currentLedger = req.query.current_ledger ? Number(req.query.current_ledger) : undefined;
+    const page = req.query.page ? Math.max(1, Number(req.query.page)) : undefined;
 
     try {
+      const conditions: string[] = [];
+      const params: any[] = [];
+      let paramIndex = 1;
+
+      // Build WHERE clauses from filters
+      if (proposer) {
+        conditions.push(`proposer = $${paramIndex++}`);
+        params.push(proposer);
+      }
+
+      if (state) {
+        switch (state) {
+          case "Active":
+            if (currentLedger) {
+              conditions.push(`start_ledger <= $${paramIndex}`);
+              params.push(currentLedger);
+              paramIndex++;
+              conditions.push(`end_ledger > $${paramIndex}`);
+              params.push(currentLedger);
+              paramIndex++;
+              conditions.push(`executed = false AND cancelled = false`);
+            }
+            break;
+          case "Pending":
+            if (currentLedger) {
+              conditions.push(`start_ledger > $${paramIndex}`);
+              params.push(currentLedger);
+              paramIndex++;
+              conditions.push(`executed = false AND cancelled = false`);
+            }
+            break;
+          case "Succeeded":
+            if (currentLedger) {
+              conditions.push(`end_ledger <= $${paramIndex}`);
+              params.push(currentLedger);
+              paramIndex++;
+              conditions.push(`executed = false AND cancelled = false AND queued = false`);
+              conditions.push(`votes_for > votes_against`);
+            }
+            break;
+          case "Defeated":
+            if (currentLedger) {
+              conditions.push(`end_ledger <= $${paramIndex}`);
+              params.push(currentLedger);
+              paramIndex++;
+              conditions.push(`executed = false AND cancelled = false AND queued = false`);
+              conditions.push(`votes_for <= votes_against`);
+            }
+            break;
+          case "Queued":
+            conditions.push(`queued = true AND executed = false`);
+            break;
+          case "Executed":
+            conditions.push(`executed = true`);
+            break;
+          case "Cancelled":
+            conditions.push(`cancelled = true`);
+            break;
+        }
+      }
+
       let query: string;
-      let params: any[];
       let key: string;
 
-      // Use cursor-based pagination if before/after is provided
-      if (before !== undefined || after !== undefined) {
+      if (page !== undefined) {
+        // Page-based pagination
+        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+        query = `SELECT * FROM proposals ${whereClause} ORDER BY id DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+        params.push(limit, (page - 1) * limit);
+        key = `proposals:page:${page}:${limit}:${state ?? ""}:${proposer ?? ""}:${currentLedger ?? ""}`;
+      } else if (before !== undefined || after !== undefined) {
+        // Cursor-based pagination
         if (before !== undefined) {
-          // Fetch proposals with id < before
-          query = "SELECT * FROM proposals WHERE id < $1 ORDER BY id DESC LIMIT $2";
-          params = [before, limit];
-          key = `proposals:before:${before}:${limit}`;
+          conditions.push(`id < $${paramIndex++}`);
+          params.push(before);
+          query = `SELECT * FROM proposals ${conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""} ORDER BY id DESC LIMIT $${paramIndex}`;
+          params.push(limit);
+          key = `proposals:before:${before}:${limit}:${state ?? ""}:${proposer ?? ""}:${currentLedger ?? ""}`;
         } else {
-          // Fetch proposals with id > after
-          query = "SELECT * FROM proposals WHERE id > $1 ORDER BY id ASC LIMIT $2";
-          params = [after, limit];
-          key = `proposals:after:${after}:${limit}`;
+          conditions.push(`id > $${paramIndex++}`);
+          params.push(after);
+          query = `SELECT * FROM proposals ${conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""} ORDER BY id ASC LIMIT $${paramIndex}`;
+          params.push(limit);
+          key = `proposals:after:${after}:${limit}:${state ?? ""}:${proposer ?? ""}:${currentLedger ?? ""}`;
         }
       } else {
         // Fall back to offset-based pagination for backwards compatibility
-        query = "SELECT * FROM proposals ORDER BY id DESC LIMIT $1 OFFSET $2";
-        params = [limit, offset];
-        key = `proposals:${offset}:${limit}`;
+        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+        query = `SELECT * FROM proposals ${whereClause} ORDER BY id DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+        params.push(limit, offset);
+        key = `proposals:${offset}:${limit}:${state ?? ""}:${proposer ?? ""}:${currentLedger ?? ""}`;
       }
 
       const data = await cached(key, TTL.proposals, async () => {
@@ -360,7 +544,7 @@ export function createApp(server: SorobanRpc.Server): express.Application {
   );
 
   // GET /delegates?top=20
-  app.get("/delegates", async (req: Request, res: Response): Promise<void> => {
+  app.get("/delegates", strictLimiter, async (req: Request, res: Response): Promise<void> => {
     const top = Math.min(Number(req.query.top ?? 20), 100);
     const key = `delegates:${top}`;
     try {
@@ -387,6 +571,7 @@ export function createApp(server: SorobanRpc.Server): express.Application {
   // GET /profile/:address
   app.get(
     "/profile/:address",
+    strictLimiter,
     async (req: Request, res: Response): Promise<void> => {
       const { address } = req.params;
       const key = `profile:${address}`;
