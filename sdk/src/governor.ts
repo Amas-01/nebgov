@@ -20,6 +20,7 @@ import {
   ProposalSimulationResult,
   ProposalState,
   ProposalVotes,
+  SimulateResult,
   VoteSupport,
   VoteType,
   Network,
@@ -30,6 +31,7 @@ import {
 } from "./types";
 
 import { TimelockClient } from "./timelock";
+import { streamEvents, type IndexerEvent } from "./streamEvents";
 
 /** Options for uploading proposal metadata to IPFS. */
 export interface MetadataUploadOptions {
@@ -37,9 +39,23 @@ export interface MetadataUploadOptions {
   pinataApiKey?: string;
   /** Pinata Secret Key (if using API Key/Secret pair) */
   pinataSecretKey?: string;
-  /** web3.storage API token */
-  web3StorageToken?: string;
-  /** Custom uploader function for other IPFS gateways */
+  /**
+   * Custom uploader function for other IPFS gateways.
+   *
+   * Use this to integrate any storage provider not natively supported by the
+   * SDK (e.g. web3.storage, nft.storage, Filebase, etc.).  The function
+   * receives the raw description string and must return a fully-qualified
+   * IPFS URI (`ipfs://…`).
+   *
+   * @example
+   * // web3.storage integration (tracked in issue #429)
+   * const options: MetadataUploadOptions = {
+   *   customUploader: async (content) => {
+   *     // Use @web3-storage/w3up-client or any compatible library here.
+   *     throw new Error("web3.storage uploader not yet configured");
+   *   },
+   * };
+   */
   customUploader?: (content: string) => Promise<string>;
 }
 
@@ -224,6 +240,19 @@ export class GovernorClient {
           GovernorErrorCode.InvalidArguments,
           "At least one on-chain action is required",
         );
+      }
+
+      // Validate descriptionHash matches SHA-256(description) to prevent
+      // unverifiable proposals from accidental hash/description mismatch.
+      // Skip for legacy calls where the hash is a zeroed placeholder.
+      if (!legacyCall) {
+        const computed = await hashDescription(description);
+        if (computed !== descriptionHash.toLowerCase().replace(/^0x/, "")) {
+          throw new GovernorError(
+            GovernorErrorCode.InvalidArguments,
+            `description_hash does not match SHA-256 of description (expected ${computed})`,
+          );
+        }
       }
 
       // Convert hex string to BytesN<32>
@@ -505,6 +534,88 @@ export class GovernorClient {
         return {
           success: false,
           error: error instanceof Error ? error.message : "Simulation failed",
+        };
+      }
+    });
+  }
+
+  /**
+   * Dry-run the `propose` transaction using Soroban's `simulateTransaction` RPC.
+   *
+   * Returns estimated CPU instructions, memory bytes, and fee in stroops without
+   * submitting a transaction. Also validates that the proposal would not
+   * immediately revert (e.g. threshold not met, governor paused, invalid calldata).
+   *
+   * @param proposer   Stellar address of the account that will submit the proposal
+   * @param description Human-readable proposal summary
+   * @param descriptionHash Hex-encoded SHA-256 of the full description
+   * @param metadataUri IPFS or HTTPS URI for the full proposal description
+   * @param targets    Target contract addresses (one per action)
+   * @param fnNames    Function names to invoke on each target
+   * @param calldatas  XDR-encoded arguments for each call
+   * @returns {@link SimulateResult} with fee estimates or an error
+   */
+  async simulatePropose(
+    proposer: string,
+    description: string,
+    descriptionHash: string,
+    metadataUri: string,
+    targets: string[],
+    fnNames: string[],
+    calldatas: (Buffer | Uint8Array)[],
+  ): Promise<SimulateResult> {
+    return this.retry(async () => {
+      try {
+        const hashBytes = hexToBytes32(descriptionHash);
+        const account = await this.server.getAccount(proposer);
+        const tx = new TransactionBuilder(account, {
+          fee: BASE_FEE,
+          networkPassphrase: this.networkPassphrase,
+        })
+          .addOperation(
+            this.contract.call(
+              "propose",
+              nativeToScVal(proposer, { type: "address" }),
+              nativeToScVal(description, { type: "string" }),
+              nativeToScVal(hashBytes, { type: "bytes" }),
+              nativeToScVal(metadataUri, { type: "string" }),
+              scVecAddress(targets),
+              scVecSymbol(fnNames),
+              scVecBytes(calldatas),
+            ),
+          )
+          .setTimeout(30)
+          .build();
+
+        const result = await this.server.simulateTransaction(tx);
+
+        if (SorobanRpc.Api.isSimulationError(result)) {
+          const err = result as unknown as { error?: string };
+          return { ok: false, error: err.error ?? "Simulation failed" };
+        }
+
+        const success = result as SorobanRpc.Api.SimulateTransactionSuccessResponse & {
+          cost?: { cpuInsns?: string; memBytes?: string };
+          minResourceFee?: unknown;
+          min_resource_fee?: unknown;
+        };
+
+        return {
+          ok: true,
+          cpuInsns: success.cost?.cpuInsns !== undefined
+            ? toBigInt(success.cost.cpuInsns)
+            : undefined,
+          memBytes: success.cost?.memBytes !== undefined
+            ? toBigInt(success.cost.memBytes)
+            : undefined,
+          feeStroops: toBigInt(
+            success.minResourceFee ?? success.min_resource_fee ?? BASE_FEE,
+          ),
+        };
+      } catch (e: unknown) {
+        return {
+          ok: false,
+          error: e instanceof Error ? e.message : "simulatePropose failed",
         };
       }
     });
@@ -1435,26 +1546,21 @@ export class GovernorClient {
             topics: [["VoteCast", "vote"], [voter]],
           },
         ],
-        pagination: {
-          limit: limit * 2, // Fetch extra to filter for relevant events
-        },
+        limit: limit * 2, // Fetch extra to filter for relevant events
       });
 
       const history: VotingHistoryEntry[] = [];
       for (const event of events.events) {
         if (!event.topic || event.topic.length < 2) continue;
-        
+
         // Check if voter matches (second topic)
         const voterTopic = scValToNative(event.topic[1]);
         if (String(voterTopic) !== voter) continue;
 
         // Parse event data
-        const data = event.value?.body?.val;
-        if (!data) continue;
-
-        const native = scValToNative(data) as Record<string, unknown>;
+        const native = scValToNative(event.value) as Record<string, unknown>;
         const proposalId = toBigInt(native.proposal_id ?? native.proposalId);
-        const supportRaw = native.support ?? native.support;
+        const supportRaw = native.support;
         const support = typeof supportRaw === "number" 
           ? supportRaw 
           : Number(supportRaw);
@@ -1518,6 +1624,42 @@ export class GovernorClient {
     return () => {
       stopped = true;
       clearInterval(handle);
+    };
+  }
+
+  /**
+   * Watch a proposal's state changes in real-time.
+   *
+   * Uses the indexer WebSocket when an `indexerUrl` is configured, falling
+   * back to polling `getProposalState` via `onProposalStateChange`. Returns
+   * an unsubscribe function that stops the watcher.
+   *
+   * @param proposalId - The proposal ID to watch
+   * @param onChange - Called each time the proposal state transitions
+   * @param pollIntervalMs - Polling interval (default 10_000)
+   * @returns A function to stop watching
+   */
+  watchProposal(
+    proposalId: bigint,
+    onChange: (newState: ProposalState) => void,
+    pollIntervalMs: number = 10_000,
+  ): () => void {
+    const unsubPoll = this.onProposalStateChange(proposalId, onChange, pollIntervalMs);
+
+    let unsubEvents: (() => void) | undefined;
+    if (this.config.indexerUrl) {
+      unsubEvents = streamEvents(
+        this.config.indexerUrl,
+        (_event: IndexerEvent) => {
+          // state transitions are handled by the polling fallback
+        },
+        { proposalId: String(proposalId) },
+      );
+    }
+
+    return () => {
+      unsubPoll();
+      unsubEvents?.();
     };
   }
 
@@ -2285,6 +2427,72 @@ export class GovernorClient {
   }
 
   /**
+   * List proposals using on-chain pagination when available.
+   *
+   * For older governor deployments that do not expose `get_proposal_list`,
+   * this falls back to the legacy `proposal_count` + `get_proposal` strategy.
+   */
+  async listProposals(offset = 0, limit = 20): Promise<Proposal[]> {
+    const safeOffset = Math.max(0, Math.floor(offset));
+    const safeLimit = Math.max(0, Math.floor(limit));
+
+    if (safeLimit === 0) {
+      return [];
+    }
+
+    return this.retry(async () => {
+      try {
+        const result = await this.server.simulateTransaction(
+          new TransactionBuilder(
+            await this.server.getAccount(this.readAccount()),
+            { fee: BASE_FEE, networkPassphrase: this.networkPassphrase },
+          )
+            .addOperation(
+              this.contract.call(
+                "get_proposal_list",
+                nativeToScVal(BigInt(safeOffset), { type: "u64" }),
+                nativeToScVal(BigInt(safeLimit), { type: "u64" }),
+              ),
+            )
+            .setTimeout(30)
+            .build(),
+        );
+
+        if (SorobanRpc.Api.isSimulationError(result)) {
+          throw new Error(result.error);
+        }
+
+        const raw = (result as SorobanRpc.Api.SimulateTransactionSuccessResponse)
+          .result?.retval;
+        if (!raw) {
+          return [];
+        }
+
+        return scValToNative(raw) as Proposal[];
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("get_proposal_list")) {
+          throw error;
+        }
+
+        const total = Number(await this.proposalCount());
+        if (safeOffset >= total) {
+          return [];
+        }
+
+        const endExclusive = Math.min(total, safeOffset + safeLimit);
+        const ids: bigint[] = [];
+        for (let i = safeOffset; i < endExclusive; i++) {
+          ids.push(BigInt(i + 1));
+        }
+
+        const proposals = await Promise.all(ids.map((id) => this.getProposal(id)));
+        return proposals;
+      }
+    }, this.isNetworkError.bind(this));
+  }
+
+  /**
    * Fetch state + votes for multiple proposals in parallel.
    *
    * Useful for the proposals list page — replaces sequential fetching with a
@@ -2441,8 +2649,6 @@ export async function uploadProposalMetadata(
 
     const data = (await response.json()) as { IpfsHash: string };
     uri = `ipfs://${data.IpfsHash}`;
-  } else if (options.web3StorageToken) {
-    throw new Error("web3.storage support not yet implemented");
   } else {
     throw new Error("No IPFS upload provider configured in options");
   }

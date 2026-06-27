@@ -1,6 +1,7 @@
 import { SorobanRpc, scValToNative } from "@stellar/stellar-sdk";
 import { pool } from "./db";
 import { invalidate, invalidatePattern } from "./cache";
+import { broadcast } from "./ws";
 
 /**
  * Normalises both legacy short-symbol topics (e.g. "prop_crtd") and the newer
@@ -14,7 +15,9 @@ const TOPIC_MAP: Record<string, string> = {
   vote_rsn: "VoteCastWithReason",
   queued: "ProposalQueued",
   executed: "ProposalExecuted",
+  cancelled: "ProposalCancelled",
   delegate: "DelegateChanged",
+  del_chsh: "DelegateChanged",
   config_updated: "ConfigUpdated",
   upgraded: "GovernorUpgraded",
   // New-form (already canonical — identity mappings keep the map exhaustive)
@@ -23,6 +26,7 @@ const TOPIC_MAP: Record<string, string> = {
   VoteCastWithReason: "VoteCastWithReason",
   ProposalQueued: "ProposalQueued",
   ProposalExecuted: "ProposalExecuted",
+  ProposalCancelled: "ProposalCancelled",
   DelegateChanged: "DelegateChanged",
   ConfigUpdated: "ConfigUpdated",
   GovernorUpgraded: "GovernorUpgraded",
@@ -143,6 +147,9 @@ export async function processEvents(
             case "GovernorUpgraded":
               await handleGovernorUpgraded(event, topics);
               break;
+            case "ProposalCancelled":
+              await handleProposalCancelled(event, topics);
+              break;
             default:
               break;
           }
@@ -182,6 +189,10 @@ async function handleProposalCreated(
     [String(id), proposer, description, startLedger, endLedger],
   );
   invalidate(`profile:${proposer}`);
+  broadcast({
+    type: "proposal_created",
+    data: { id: String(id), proposer, description, start_ledger: startLedger, end_ledger: endLedger },
+  });
 }
 
 async function handleVoteCast(
@@ -220,6 +231,10 @@ async function handleVoteCast(
   ]);
   invalidate(`proposal_votes:${proposalId}`, `profile:${voter}`);
   invalidatePattern("proposals:");
+  broadcast({
+    type: "vote_cast",
+    data: { proposal_id: proposalId, voter, support, weight, reason: reason ?? undefined },
+  });
 }
 
 async function handleProposalQueued(topics: unknown[]): Promise<void> {
@@ -229,6 +244,7 @@ async function handleProposalQueued(topics: unknown[]): Promise<void> {
   ]);
   invalidate(`proposal_votes:${proposalId}`);
   invalidatePattern("proposals:");
+  broadcast({ type: "proposal_queued", data: { proposal_id: proposalId } });
 }
 
 async function handleProposalExecuted(topics: unknown[]): Promise<void> {
@@ -238,6 +254,7 @@ async function handleProposalExecuted(topics: unknown[]): Promise<void> {
   ]);
   invalidate(`proposal_votes:${proposalId}`);
   invalidatePattern("proposals:");
+  broadcast({ type: "proposal_executed", data: { proposal_id: proposalId } });
 }
 
 async function handleDelegateChanged(
@@ -255,6 +272,10 @@ async function handleDelegateChanged(
   );
   invalidatePattern("delegates:");
   invalidate(`profile:${delegator}`);
+  broadcast({
+    type: "delegate_changed",
+    data: { delegator, old_delegatee: oldDelegatee, new_delegatee: newDelegatee, ledger: event.ledger },
+  });
 }
 
 async function handleWrapperDeposit(
@@ -271,6 +292,7 @@ async function handleWrapperDeposit(
     [account, amount, event.ledger],
   );
   invalidate(`profile:${account}`);
+  broadcast({ type: "wrapper_deposit", data: { account, amount, ledger: event.ledger } });
 }
 
 async function handleWrapperWithdraw(
@@ -287,6 +309,7 @@ async function handleWrapperWithdraw(
     [account, amount, event.ledger],
   );
   invalidate(`profile:${account}`);
+  broadcast({ type: "wrapper_withdrawal", data: { account, amount, ledger: event.ledger } });
 }
 
 async function handleTreasuryBatchTransfer(
@@ -325,6 +348,18 @@ interface GovernorSettings {
   proposal_cooldown?: number;
   max_proposals_per_period?: number;
   proposal_period_duration?: number;
+}
+
+function stringifyJson(value: unknown): string {
+  return JSON.stringify(value, (_key, current) =>
+    typeof current === "bigint" ? current.toString() : current,
+  );
+}
+
+function parseLedgerClosedAt(value: unknown): Date | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function toNumber(value: unknown): number | null {
@@ -391,17 +426,33 @@ async function handleConfigUpdated(
   topics: unknown[],
 ): Promise<void> {
   const data = scValToNative(event.value) as Record<string, unknown>;
+  const oldSettings =
+    data.old_settings === undefined || data.old_settings === null
+      ? null
+      : toGovernorSettings(data.old_settings);
   const newSettings = toGovernorSettings(data.new_settings);
+
+  if ((data.old_settings !== undefined && data.old_settings !== null) && !oldSettings) {
+    console.error("Failed to parse old_settings from ConfigUpdated event");
+    return;
+  }
 
   if (!newSettings) {
     console.error("Failed to parse new_settings from ConfigUpdated event");
     return;
   }
 
+  const ledgerClosedAt = parseLedgerClosedAt((event as any).ledgerClosedAt);
+
   await pool.query(
-    `INSERT INTO config_updates (ledger, new_settings)
-     VALUES ($1, $2)`,
-    [event.ledger, JSON.stringify(newSettings)],
+    `INSERT INTO config_updates (ledger, old_settings, new_settings, ledger_closed_at)
+     VALUES ($1, $2, $3, $4)`,
+    [
+      event.ledger,
+      oldSettings ? stringifyJson(oldSettings) : null,
+      stringifyJson(newSettings),
+      ledgerClosedAt,
+    ],
   );
 }
 
@@ -422,4 +473,47 @@ async function handleGovernorUpgraded(
      VALUES ($1, $2)`,
     [event.ledger, hashStr],
   );
+}
+
+async function handleProposalCancelled(
+  event: SorobanRpc.Api.EventResponse,
+  topics: unknown[],
+): Promise<void> {
+  const value = scValToNative(event.value);
+
+  let proposalId: string;
+  let cancelledAtLedger: number;
+  let caller: string;
+
+  if (Array.isArray(value)) {
+    // cancel_queued format: (proposal_id: u64, queue_time: u32, current_ledger: u32)
+    proposalId = String(value[0] as bigint);
+    cancelledAtLedger = Number(value[2]);
+    caller = topics.length > 1 ? String(topics[1]) : "unknown";
+  } else if (value && typeof value === "object") {
+    // emit_proposal_cancelled format: ProposalCancelledEvent { proposal_id, caller }
+    const obj = value as Record<string, unknown>;
+    proposalId = String(obj.proposal_id);
+    cancelledAtLedger = event.ledger;
+    caller = String(obj.caller ?? "unknown");
+  } else {
+    return;
+  }
+
+  await pool.query("UPDATE proposals SET cancelled = true WHERE id = $1", [
+    proposalId,
+  ]);
+
+  await pool.query(
+    `INSERT INTO proposal_cancellations (proposal_id, cancelled_at_ledger, caller)
+     VALUES ($1, $2, $3)
+     ON CONFLICT DO NOTHING`,
+    [proposalId, cancelledAtLedger, caller],
+  );
+
+  invalidatePattern("proposals:");
+  broadcast({
+    type: "proposal_cancelled",
+    data: { proposal_id: proposalId, cancelled_at_ledger: cancelledAtLedger, caller },
+  });
 }

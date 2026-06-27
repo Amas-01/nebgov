@@ -1,13 +1,16 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
+// Prevent future introduction of dead match patterns in this security-critical
+// state machine (issue #439).
+#![deny(unreachable_patterns)]
 
 mod events;
 
 use soroban_sdk::xdr::FromXdr;
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
-    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
-    Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 /// Governor error codes.
@@ -41,6 +44,13 @@ pub enum GovernorError {
     VotesTokenNotSet = 25,
     PauserNotSet = 26,
     ArithmeticOverflow = 27,
+    VotePeriodTooShort = 28,
+    ExecutionWindowZero = 29,
+    TooManyCalldataEntries = 30,
+    /// Vote was cast outside the proposal's Active voting window.
+    ProposalNotActive = 31,
+    /// The contract has already been initialized.
+    AlreadyInitialized = 32,
 }
 
 /// Cross-contract interface for the Timelock contract.
@@ -92,6 +102,8 @@ pub trait VotesTrait {
     fn get_past_votes(env: Env, account: Address, ledger: u32) -> i128;
     /// Get the total token supply at a past ledger sequence (snapshot).
     fn get_past_total_supply(env: Env, ledger: u32) -> i128;
+    /// Get the underlying SEP-41 token address that this token-votes contract wraps.
+    fn token(env: Env) -> Address;
 }
 
 /// Cross-contract interface for the Reflector oracle.
@@ -234,6 +246,29 @@ pub struct CanProposeResult {
     pub threshold: i128,
 }
 
+/// Counts of proposals grouped by their current state.
+///
+/// Returned by [`GovernorContract::proposals_count_by_state`] so the UI can
+/// render filter-tab badges without fetching every proposal individually.
+///
+/// # Gas cost
+/// This function iterates every proposal via `state()`, so callers should
+/// budget approximately `O(proposal_count)` read-heavy CPU units. For
+/// governors with thousands of proposals, consider caching the result
+/// off-chain or calling it infrequently.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposalStateCounts {
+    pub pending: u64,
+    pub active: u64,
+    pub succeeded: u64,
+    pub defeated: u64,
+    pub queued: u64,
+    pub executed: u64,
+    pub cancelled: u64,
+    pub expired: u64,
+}
+
 /// Vote support options.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -310,6 +345,12 @@ pub enum DataKey {
     MaxProposalsPerPeriod,
     /// Period duration in ledgers for proposal rate limiting.
     ProposalPeriodDuration,
+    /// Cached timelock min_delay (seconds) written once at initialize time.
+    CachedTimelockDelay,
+    /// Cached timelock execution_window (seconds) written once at initialize time.
+    CachedExecutionWindow,
+    /// Ordered list of proposal ids for pagination.
+    ProposalList,
 }
 
 #[contract]
@@ -317,11 +358,74 @@ pub struct GovernorContract;
 
 #[contractimpl]
 impl GovernorContract {
+    /// Approximate number of seconds per Soroban ledger close.
+    ///
+    /// Used to convert timelock delay/window values (in seconds) to ledger
+    /// counts. Stellar Mainnet closes ledgers roughly every 5 seconds; this
+    /// constant must be kept consistent across all conversion sites in this
+    /// file so that TTL extensions and veto-window calculations use the same
+    /// baseline.
+    const SECONDS_PER_LEDGER: u64 = 5;
+
     fn must_get_proposal(env: &Env, proposal_id: u64) -> Proposal {
         env.storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
             .unwrap_or_else(|| env.panic_with_error(GovernorError::ProposalNotFound))
+    }
+
+    /// Extend the TTL of a proposal storage entry to cover its full lifecycle.
+    ///
+    /// Soroban persistent storage entries have a TTL that must be explicitly extended.
+    /// This function ensures a proposal's storage entry will not expire before the
+    /// proposal can be executed. The TTL is extended to cover:
+    /// - Voting period (end_ledger - current_ledger)
+    /// - Grace period (proposal_grace_period)
+    /// - Timelock delay and execution window
+    /// - Additional buffer for safety
+    fn extend_proposal_ttl(env: &Env, proposal_id: u64, proposal: &Proposal) {
+        let current = env.ledger().sequence();
+
+        let grace_period: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalGracePeriod)
+            .unwrap_or(120_960);
+
+        // Use cached timelock timing values (written at initialize time) to avoid
+        // repeated cross-contract calls. Falls back to live calls for pre-migration
+        // contracts that don't have the cache entries yet.
+        let cached_delay: Option<u64> = env.storage().instance().get(&DataKey::CachedTimelockDelay);
+        let cached_window: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CachedExecutionWindow);
+        let timelock_delay_ledgers: u32 = match (cached_delay, cached_window) {
+            (Some(d), Some(w)) => ((d + w) / Self::SECONDS_PER_LEDGER) as u32,
+            _ => {
+                let timelock_addr: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Timelock)
+                    .unwrap_or_else(|| env.panic_with_error(GovernorError::TimelockNotSet));
+                let timelock = TimelockClient::new(env, &timelock_addr);
+                ((timelock.min_delay() + timelock.execution_window()) / Self::SECONDS_PER_LEDGER)
+                    as u32
+            }
+        };
+
+        let ledgers_until_end = proposal.end_ledger.saturating_sub(current);
+
+        let ttl_ledgers = ledgers_until_end
+            .saturating_add(grace_period)
+            .saturating_add(timelock_delay_ledgers)
+            .saturating_add(1000);
+
+        env.storage().persistent().extend_ttl(
+            &DataKey::Proposal(proposal_id),
+            ttl_ledgers,
+            ttl_ledgers,
+        );
     }
 
     fn decode_calldata_args(env: &Env, data: &Bytes) -> Vec<Val> {
@@ -349,7 +453,7 @@ impl GovernorContract {
 
         let current = env.ledger().sequence();
         let quorum = Self::quorum(env.clone(), proposal.id);
-        let quorum_met = proposal.votes_for >= quorum;
+        let quorum_met = proposal.votes_for + proposal.votes_abstain >= quorum;
         let for_wins = proposal.votes_for > proposal.votes_against;
 
         if current > proposal.end_ledger && !(quorum_met && for_wins) {
@@ -376,6 +480,30 @@ impl GovernorContract {
         proposal_grace_period: u32,
     ) {
         admin.require_auth();
+        if env.storage().instance().has(&DataKey::Admin) {
+            env.panic_with_error(GovernorError::AlreadyInitialized);
+        }
+        if voting_period == 0 {
+            env.panic_with_error(GovernorError::VotePeriodTooShort);
+        }
+        let timelock_client = TimelockClient::new(&env, &timelock);
+        let execution_window = timelock_client.execution_window();
+        if execution_window == 0 {
+            env.panic_with_error(GovernorError::ExecutionWindowZero);
+        }
+        let min_delay = timelock_client.min_delay();
+        // timelock_delay + execution_window must not overflow u64
+        let _ = min_delay
+            .checked_add(execution_window)
+            .unwrap_or_else(|| env.panic_with_error(GovernorError::ArithmeticOverflow));
+        // Cache timing values so extend_proposal_ttl can avoid repeated cross-contract calls.
+        env.storage()
+            .instance()
+            .set(&DataKey::CachedTimelockDelay, &min_delay);
+        env.storage()
+            .instance()
+            .set(&DataKey::CachedExecutionWindow, &execution_window);
+
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
@@ -399,6 +527,9 @@ impl GovernorContract {
             .instance()
             .set(&DataKey::ProposalGracePeriod, &proposal_grace_period);
         env.storage().instance().set(&DataKey::ProposalCount, &0u64);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalList, &Vec::<u64>::new(&env));
         env.storage().instance().set(
             &DataKey::CurrentWasmHash,
             &BytesN::from_array(&env, &[0u8; 32]),
@@ -450,16 +581,6 @@ impl GovernorContract {
     ) -> u64 {
         proposer.require_auth();
 
-        // Check if contract is paused
-        let is_paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::IsPaused)
-            .unwrap_or(false);
-        if is_paused {
-            env.panic_with_error(GovernorError::ContractPaused);
-        }
-
         // Validate all vectors have the same length
         if !(targets.len() == fn_names.len() && targets.len() == calldatas.len()) {
             env.panic_with_error(GovernorError::InvalidVectorLengths);
@@ -479,6 +600,20 @@ impl GovernorContract {
             if calldata.len() > max_calldata_size {
                 env.panic_with_error(GovernorError::CalldataTooLarge);
             }
+        }
+
+        // Validate calldata count (Issue #447)
+        //
+        // MaxCalldataSize limits the byte size of each individual calldata entry,
+        // but does not bound the *number* of entries.  A proposal with thousands
+        // of tiny entries would pass the size check yet exhaust the Soroban
+        // compute budget when execute() iterates and dispatches every entry.
+        //
+        // 10 is a conservative upper bound that covers all realistic batch
+        // governance proposals while preventing compute-exhaustion attacks.
+        const MAX_CALLDATA_COUNT: u32 = 10;
+        if calldatas.len() > MAX_CALLDATA_COUNT {
+            env.panic_with_error(GovernorError::TooManyCalldataEntries);
         }
 
         // Rate limiting checks (Issue #188)
@@ -582,17 +717,59 @@ impl GovernorContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+        // Extend TTL to cover full proposal lifecycle
+        Self::extend_proposal_ttl(&env, proposal_id, &proposal);
         env.storage()
             .instance()
             .set(&DataKey::ProposalCount, &proposal_id);
+
+        let mut proposal_list: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalList)
+            .unwrap_or(Vec::new(&env));
+        proposal_list.push_back(proposal_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalList, &proposal_list);
 
         // Update rate limiting storage
         env.storage()
             .persistent()
             .set(&DataKey::LastProposalLedger(proposer.clone()), &current);
+        // Extend TTL for the cooldown entry so it does not expire before the
+        // cooldown period elapses (Issue #621).  Add a 1000-ledger buffer so
+        // the storage survives even if the cooldown is set close to the default
+        // Soroban TTL ceiling.
+        env.storage().persistent().extend_ttl(
+            &DataKey::LastProposalLedger(proposer.clone()),
+            cooldown.saturating_add(1000),
+            cooldown.saturating_add(1000),
+        );
+
+        // Prune the previous period's key for this proposer to prevent
+        // unbounded storage growth (Issue #716).  We only need the current
+        // period's count for rate-limiting, so the entry from
+        // `current_period - 1` can be safely removed.
+        if current_period > 0 {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ProposalsInPeriod(
+                    proposer.clone(),
+                    current_period - 1,
+                ));
+        }
+
         env.storage().persistent().set(
             &DataKey::ProposalsInPeriod(proposer.clone(), current_period),
             &(proposals_in_period + 1),
+        );
+        // Extend TTL for the period-count entry so it does not expire before
+        // the period ends (Issue #621).  Add a 1000-ledger buffer for safety.
+        env.storage().persistent().extend_ttl(
+            &DataKey::ProposalsInPeriod(proposer.clone(), current_period),
+            period_duration.saturating_add(1000),
+            period_duration.saturating_add(1000),
         );
 
         // Emit ProposalCreated event with all proposal fields
@@ -665,16 +842,6 @@ impl GovernorContract {
     pub fn cast_vote(env: Env, voter: Address, proposal_id: u64, support: VoteSupport) {
         voter.require_auth();
 
-        // Check if contract is paused
-        let is_paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::IsPaused)
-            .unwrap_or(false);
-        if is_paused {
-            env.panic_with_error(GovernorError::ContractPaused);
-        }
-
         // Validate vote support against configured vote type
         Self::validate_vote_support(&env, &support).unwrap_or_else(|e| env.panic_with_error(e));
 
@@ -689,11 +856,23 @@ impl GovernorContract {
 
         let mut proposal = Self::must_get_proposal(&env, proposal_id);
 
+        // Reject votes outside the Active window. Checking fields directly
+        // avoids a redundant storage read that Self::state() would incur.
+        let current = env.ledger().sequence();
+        if proposal.cancelled
+            || proposal.executed
+            || proposal.queued
+            || current < proposal.start_ledger
+            || current > proposal.end_ledger
+        {
+            env.panic_with_error(GovernorError::ProposalNotActive);
+        }
+
         // Look up the voter's snapshot voting power at the proposal's start ledger
         // using the active voting strategy (single token or multi-token weighted).
         let raw_weight: i128 = Self::compute_votes(&env, &voter, &proposal.start_ledger);
 
-        if raw_weight < 0 {
+        if raw_weight <= 0 {
             env.panic_with_error(GovernorError::ZeroVotingPower);
         }
 
@@ -714,6 +893,8 @@ impl GovernorContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+        // Extend TTL to cover full proposal lifecycle
+        Self::extend_proposal_ttl(&env, proposal_id, &proposal);
         env.storage()
             .persistent()
             .set(&DataKey::HasVoted(proposal_id, voter.clone()), &true);
@@ -757,9 +938,20 @@ impl GovernorContract {
 
         let mut proposal = Self::must_get_proposal(&env, proposal_id);
 
+        // Reject votes outside the Active window.
+        let current = env.ledger().sequence();
+        if proposal.cancelled
+            || proposal.executed
+            || proposal.queued
+            || current < proposal.start_ledger
+            || current > proposal.end_ledger
+        {
+            env.panic_with_error(GovernorError::ProposalNotActive);
+        }
+
         // Look up the voter's snapshot voting power at the proposal's start ledger
         let raw_weight: i128 = Self::compute_votes(&env, &voter, &proposal.start_ledger);
-        if raw_weight < 0 {
+        if raw_weight <= 0 {
             env.panic_with_error(GovernorError::ZeroVotingPower);
         }
 
@@ -780,6 +972,8 @@ impl GovernorContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+        // Extend TTL to cover full proposal lifecycle
+        Self::extend_proposal_ttl(&env, proposal_id, &proposal);
         env.storage()
             .persistent()
             .set(&DataKey::HasVoted(proposal_id, voter.clone()), &true);
@@ -812,16 +1006,6 @@ impl GovernorContract {
     ///
     /// Schedules every action in the proposal via the Timelock contract.
     pub fn queue(env: Env, proposal_id: u64) {
-        // Check if contract is paused
-        let is_paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::IsPaused)
-            .unwrap_or(false);
-        if is_paused {
-            env.panic_with_error(GovernorError::ContractPaused);
-        }
-
         let proposal_state = Self::state(env.clone(), proposal_id);
 
         if proposal_state == ProposalState::Expired {
@@ -833,6 +1017,15 @@ impl GovernorContract {
         }
 
         let mut proposal = Self::must_get_proposal(&env, proposal_id);
+
+        // Independently re-verify quorum and threshold against the final vote
+        // tally so that stale cached state cannot allow a failed proposal through.
+        let required_quorum = Self::quorum(env.clone(), proposal_id);
+        let quorum_met = proposal.votes_for + proposal.votes_abstain >= required_quorum;
+        let for_wins = proposal.votes_for > proposal.votes_against;
+        if !quorum_met || !for_wins {
+            env.panic_with_error(GovernorError::ProposalNotSucceeded);
+        }
 
         let timelock_addr: Address = env
             .storage()
@@ -891,6 +1084,8 @@ impl GovernorContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+        // Extend TTL to cover full proposal lifecycle
+        Self::extend_proposal_ttl(&env, proposal_id, &proposal);
 
         // Store the queue time (current ledger sequence) for veto window tracking
         let queue_time = env.ledger().sequence();
@@ -907,16 +1102,6 @@ impl GovernorContract {
     /// Delegates to the timelock to enforce the delay, which in turn invokes
     /// `proposal.fn_name()` on `proposal.target`.
     pub fn execute(env: Env, proposal_id: u64) {
-        // Check if contract is paused
-        let is_paused: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::IsPaused)
-            .unwrap_or(false);
-        if is_paused {
-            env.panic_with_error(GovernorError::ContractPaused);
-        }
-
         if Self::state(env.clone(), proposal_id) != ProposalState::Queued {
             env.panic_with_error(GovernorError::ProposalNotQueued);
         }
@@ -1028,6 +1213,8 @@ impl GovernorContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+        // Extend TTL to cover full proposal lifecycle
+        Self::extend_proposal_ttl(&env, proposal_id, &proposal);
 
         events::emit_proposal_executed(&env, proposal_id, &gov_addr);
     }
@@ -1082,6 +1269,8 @@ impl GovernorContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+        // Extend TTL to cover full proposal lifecycle
+        Self::extend_proposal_ttl(&env, proposal_id, &proposal);
         events::emit_proposal_cancelled(&env, proposal_id, &caller);
     }
 
@@ -1115,6 +1304,8 @@ impl GovernorContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal_mut);
+        // Extend TTL to cover full proposal lifecycle
+        Self::extend_proposal_ttl(&env, proposal_id, &proposal_mut);
 
         // If the proposal was queued, cancel its timelock operations
         if proposal_mut.queued {
@@ -1180,12 +1371,12 @@ impl GovernorContract {
         let timelock = TimelockClient::new(&env, &timelock_addr);
         let delay = timelock.min_delay();
 
-        // Check if we're still in the veto window
+        // Check if we're still in the veto window.
+        // `delay` is in seconds; convert to ledgers using the shared constant so this
+        // site matches extend_proposal_ttl (previously used /10, which halved the window).
         let current_ledger = env.ledger().sequence();
-        // For simplicity, use delay directly as ledger count (adjusting for typical Soroban block times)
-        // The veto window should close after timelock_delay seconds
-        // Conversion: assume timelock delay is in seconds and we need ledger conversion
-        let veto_window_end_ledger = queue_time + ((delay / 10) as u32); // Roughly 1 ledger per 10 seconds
+        let delay_ledgers = (delay / Self::SECONDS_PER_LEDGER) as u32;
+        let veto_window_end_ledger = queue_time.saturating_add(delay_ledgers);
 
         if current_ledger >= veto_window_end_ledger {
             env.panic_with_error(GovernorError::VetoWindowClosed);
@@ -1197,6 +1388,8 @@ impl GovernorContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal_mut);
+        // Extend TTL to cover full proposal lifecycle
+        Self::extend_proposal_ttl(&env, proposal_id, &proposal_mut);
 
         // Cancel all timelock operations associated with this proposal
         let gov_addr = env.current_contract_address();
@@ -1205,11 +1398,7 @@ impl GovernorContract {
             timelock.cancel(&gov_addr, &op_id);
         }
 
-        // Emit ProposalCancelledFromQueue event (TODO: add helper for veto event)
-        env.events().publish(
-            (Symbol::new(&env, "ProposalCancelled"), caller.clone()),
-            (proposal_id, queue_time, current_ledger),
-        );
+        events::emit_proposal_cancelled(&env, proposal_id, &caller);
     }
 
     /// Get the current state of a proposal.
@@ -1267,9 +1456,13 @@ impl GovernorContract {
         } else if !quorum_met || against_wins_or_ties {
             ProposalState::Defeated
         } else {
-            // Defensive fallback: with quorum_met=false or against_wins_or_ties=true,
-            // we must have already returned Defeated above.
-            ProposalState::Defeated
+            // This branch is structurally unreachable: the outer condition
+            // `!(quorum_met && for_wins)` means at least one of `!quorum_met`
+            // or `against_wins_or_ties` is true, so the `else if` above always
+            // matches first.  The `unreachable!()` here documents that intent
+            // and will panic loudly if a future refactor accidentally makes
+            // this path reachable (issue #439).
+            unreachable!("state machine invariant violated: defeated branch must have been taken")
         }
     }
 
@@ -1337,7 +1530,17 @@ impl GovernorContract {
                 let price_opt = oracle.try_lastprice(&votes_token_addr);
                 if let Ok(Ok(Some(price))) = price_opt {
                     if price > 0 {
-                        let usd_quorum = min_quorum_usd / price;
+                        // Query the underlying token's decimal places from the
+                        // token-votes contract so the dynamic quorum formula
+                        // correctly converts the USD floor to token units (Issue #622).
+                        let underlying_token = VotesClient::new(&env, &votes_token_addr).token();
+                        let token_decimals: u32 =
+                            token::TokenClient::new(&env, &underlying_token).decimals();
+                        let scaling_factor = 10i128.pow(token_decimals);
+                        let usd_quorum =
+                            min_quorum_usd.checked_mul(scaling_factor).unwrap_or_else(|| {
+                                env.panic_with_error(GovernorError::ArithmeticOverflow)
+                            }) / price;
                         return static_quorum.max(usd_quorum);
                     }
                 }
@@ -1574,12 +1777,132 @@ impl GovernorContract {
         events::emit_config_updated(&env, &old_settings, &new_settings);
     }
 
+    /// Update guardian independently of the full config payload.
+    ///
+    /// Authorization is restricted to the governor's own contract address.
+    /// This means the call must originate from an executed on-chain proposal.
+    pub fn set_guardian(env: Env, new_guardian: Address) {
+        env.current_contract_address().require_auth();
+
+        let old_guardian: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Guardian)
+            .unwrap_or_else(|| env.panic_with_error(GovernorError::GuardianNotSet));
+
+        if old_guardian == new_guardian {
+            return;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Guardian, &new_guardian);
+
+        events::emit_guardian_changed(&env, &old_guardian, &new_guardian);
+    }
+
+    /// Update the maximum calldata size per proposal action.
+    ///
+    /// Authorization is restricted to the governor's own contract address.
+    pub fn update_max_calldata_size(env: Env, max_calldata_size: u32) {
+        env.current_contract_address().require_auth();
+        assert!(max_calldata_size > 0, "max calldata size must be positive");
+
+        let old_settings = Self::get_settings(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxCalldataSize, &max_calldata_size);
+        let new_settings = Self::get_settings(env.clone());
+
+        events::emit_config_updated(&env, &old_settings, &new_settings);
+    }
+
+    /// Update the minimum ledgers between proposals from the same address.
+    ///
+    /// Authorization is restricted to the governor's own contract address.
+    pub fn update_proposal_cooldown(env: Env, proposal_cooldown: u32) {
+        env.current_contract_address().require_auth();
+
+        let old_settings = Self::get_settings(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCooldown, &proposal_cooldown);
+        let new_settings = Self::get_settings(env.clone());
+
+        events::emit_config_updated(&env, &old_settings, &new_settings);
+    }
+
+    /// Update the maximum proposals allowed per rate-limit period.
+    ///
+    /// Authorization is restricted to the governor's own contract address.
+    pub fn update_max_proposals_per_period(env: Env, max_proposals_per_period: u32) {
+        env.current_contract_address().require_auth();
+        assert!(
+            max_proposals_per_period > 0,
+            "max proposals per period must be positive"
+        );
+
+        let old_settings = Self::get_settings(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxProposalsPerPeriod, &max_proposals_per_period);
+        let new_settings = Self::get_settings(env.clone());
+
+        events::emit_config_updated(&env, &old_settings, &new_settings);
+    }
+
     /// Get total proposal count.
     pub fn proposal_count(env: Env) -> u64 {
         env.storage()
             .instance()
             .get(&DataKey::ProposalCount)
             .unwrap_or(0)
+    }
+
+    /// Get proposal counts grouped by their current state.
+    ///
+    /// Iterates every proposal (1..=proposal_count) and calls `state()` on
+    /// each, producing a [`ProposalStateCounts`] with counts for each
+    /// possible state. The UI can use this to render filter-tab badges
+    /// without fetching every proposal individually.
+    ///
+    /// # Gas cost
+    ///
+    /// Each iteration performs a persistent storage read and the state
+    /// machine logic from [`Self::state`]. Budget approximately:
+    /// - ~10_000 CPU insns per proposal (read + state evaluation)
+    /// - ~200 bytes memory per proposal
+    ///
+    /// For governors with thousands of proposals, call this function
+    /// infrequently and on a dedicated simulation/Horizon endpoint.
+    pub fn proposals_count_by_state(env: Env) -> ProposalStateCounts {
+        let total = Self::proposal_count(env.clone());
+        let mut counts = ProposalStateCounts {
+            pending: 0,
+            active: 0,
+            succeeded: 0,
+            defeated: 0,
+            queued: 0,
+            executed: 0,
+            cancelled: 0,
+            expired: 0,
+        };
+
+        for id in 1..=total {
+            let state = Self::state(env.clone(), id);
+            match state {
+                ProposalState::Pending => counts.pending += 1,
+                ProposalState::Active => counts.active += 1,
+                ProposalState::Succeeded => counts.succeeded += 1,
+                ProposalState::Defeated => counts.defeated += 1,
+                ProposalState::Queued => counts.queued += 1,
+                ProposalState::Executed => counts.executed += 1,
+                ProposalState::Cancelled => counts.cancelled += 1,
+                ProposalState::Expired => counts.expired += 1,
+            }
+        }
+
+        counts
     }
 
     /// Get the ledger sequence of the last proposal by an address.
@@ -1631,11 +1954,7 @@ impl GovernorContract {
         }
 
         // Get voting power
-        let votes_token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::VotesToken)
-            .unwrap();
+        let votes_token: Address = env.storage().instance().get(&DataKey::VotesToken).unwrap();
         let votes_client = VotesClient::new(&env, &votes_token);
         let voting_power = votes_client.get_votes(&proposer);
 
@@ -1945,6 +2264,11 @@ impl GovernorContract {
         env.current_contract_address().require_auth();
         // TODO: implement storage migration logic when a breaking storage
         // change is introduced in a future upgrade.
+
+        // Post-condition validation guard to ensure VotesToken is not cleared from storage (see #696).
+        if !env.storage().instance().has(&DataKey::VotesToken) {
+            env.panic_with_error(GovernorError::VotesTokenNotSet);
+        }
     }
 
     // ============================================================================
@@ -1972,9 +2296,19 @@ impl GovernorContract {
     }
 
     /// Unpause the contract to resume normal operations.
-    /// Only callable via governance proposal (requires contract self-auth).
-    pub fn unpause(env: Env) {
-        env.current_contract_address().require_auth();
+    /// Callable by the designated pauser address (same as pause()).
+    pub fn unpause(env: Env, caller: Address) {
+        caller.require_auth();
+
+        let pauser: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Pauser)
+            .unwrap_or_else(|| env.panic_with_error(GovernorError::PauserNotSet));
+
+        if caller != pauser {
+            env.panic_with_error(GovernorError::UnauthorizedPause);
+        }
 
         env.storage().instance().set(&DataKey::IsPaused, &false);
 
@@ -2009,10 +2343,7 @@ impl GovernorContract {
 
         env.storage().instance().set(&DataKey::Pauser, &new_pauser);
 
-        env.events().publish(
-            (Symbol::new(&env, "PauserChanged"),),
-            (old_pauser, new_pauser),
-        );
+        events::emit_pauser_changed(&env, &old_pauser, &new_pauser);
     }
 
     // ============================================================================
@@ -2047,6 +2378,90 @@ impl GovernorContract {
         let proposal = Self::must_get_proposal(&env, proposal_id);
         proposal.op_ids
     }
+
+    /// Get a proposal by ID.
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Proposal {
+        Self::must_get_proposal(&env, proposal_id)
+    }
+
+    /// Get a paginated list of proposals in creation order.
+    pub fn get_proposal_list(env: Env, offset: u64, limit: u64) -> Vec<Proposal> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let proposal_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalList)
+            .unwrap_or(Vec::new(&env));
+
+        let total = proposal_ids.len() as u64;
+        if offset >= total {
+            return Vec::new(&env);
+        }
+
+        let end = core::cmp::min(offset.saturating_add(limit), total);
+        let mut proposals = Vec::new(&env);
+
+        for i in offset..end {
+            let proposal_id = proposal_ids.get(i as u32).unwrap();
+            proposals.push_back(Self::must_get_proposal(&env, proposal_id));
+        }
+
+        proposals
+    }
+
+    // ============================================================================
+    // Execution Gas Estimation (Issue #715)
+    // ============================================================================
+
+    /// Base CPU instructions per action.
+    const BASE_CPU_PER_ACTION: u64 = 25_000;
+    /// CPU instructions per byte of calldata.
+    const CPU_PER_CALLDATA_BYTE: u64 = 10;
+    /// Fixed base CPU cost for gas estimation overhead.
+    const BASE_CPU_FIXED: u64 = 50_000;
+    /// Base memory bytes per action.
+    const BASE_MEM_PER_ACTION: u64 = 5_000;
+    /// Memory bytes per calldata byte.
+    const MEM_PER_CALLDATA_BYTE: u64 = 2;
+    /// Fixed base memory cost.
+    const BASE_MEM_FIXED: u64 = 10_000;
+    /// Stroops per CPU instruction for fee estimation.
+    const STROOPS_PER_CPU_INSN: i128 = 100;
+    /// Stroops per memory byte for fee estimation.
+    const STROOPS_PER_MEM_BYTE: i128 = 10;
+
+    /// Estimate the gas/resources required to execute a queued proposal.
+    ///
+    /// Returns an [`ExecutionGasEstimate`] with estimated CPU instructions,
+    /// memory bytes, and fee in stroops based on the number of actions and
+    /// total calldata size.
+    pub fn estimate_execution_gas(env: Env, proposal_id: u64) -> ExecutionGasEstimate {
+        let proposal = Self::must_get_proposal(&env, proposal_id);
+        let action_count = proposal.targets.len();
+        let mut calldata_bytes: u32 = 0;
+        for i in 0..proposal.calldatas.len() {
+            calldata_bytes += proposal.calldatas.get(i).unwrap().len();
+        }
+        let estimated_cpu_insns = Self::BASE_CPU_FIXED
+            + (action_count as u64) * Self::BASE_CPU_PER_ACTION
+            + (calldata_bytes as u64) * Self::CPU_PER_CALLDATA_BYTE;
+        let estimated_mem_bytes = Self::BASE_MEM_FIXED
+            + (action_count as u64) * Self::BASE_MEM_PER_ACTION
+            + (calldata_bytes as u64) * Self::MEM_PER_CALLDATA_BYTE;
+        let estimated_fee_stroops = (estimated_cpu_insns as i128) * Self::STROOPS_PER_CPU_INSN
+            + (estimated_mem_bytes as i128) * Self::STROOPS_PER_MEM_BYTE;
+        ExecutionGasEstimate {
+            proposal_id,
+            action_count,
+            calldata_bytes,
+            estimated_cpu_insns,
+            estimated_mem_bytes,
+            estimated_fee_stroops,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2063,8 +2478,17 @@ mod test {
     #[contract]
     pub struct MockVotesContract;
 
+    #[contracttype]
+    enum MockDataKey {
+        Token,
+    }
+
     #[contractimpl]
     impl MockVotesContract {
+        pub fn set_token(env: Env, token: Address) {
+            env.storage().instance().set(&MockDataKey::Token, &token);
+        }
+
         pub fn get_votes(_env: Env, _account: Address) -> i128 {
             // Return a high vote count that exceeds any reasonable threshold
             1_000_000
@@ -2078,6 +2502,29 @@ mod test {
         pub fn get_past_total_supply(_env: Env, _ledger: u32) -> i128 {
             // Return a fixed total supply for quorum calculations in tests
             10_000_000
+        }
+
+        pub fn token(env: Env) -> Address {
+            env.storage()
+                .instance()
+                .get(&MockDataKey::Token)
+                .unwrap_or_else(|| Address::generate(&env))
+        }
+    }
+
+    /// Minimal timelock stub that satisfies the execution_window / min_delay
+    /// calls made by governor.initialize() without requiring a full timelock setup.
+    #[contract]
+    pub struct MockTimelockContract;
+
+    #[contractimpl]
+    impl MockTimelockContract {
+        pub fn execution_window(_env: Env) -> u64 {
+            86_400
+        }
+
+        pub fn min_delay(_env: Env) -> u64 {
+            3_600
         }
     }
 
@@ -2129,7 +2576,7 @@ mod test {
 
         let admin = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
@@ -2149,6 +2596,9 @@ mod test {
 
         let proposal_id = propose_dummy(&env, &client, &proposer);
 
+        // voting_delay = 100: advance past start_ledger so the proposal is Active.
+        env.ledger().with_mut(|l| l.sequence_number += 101);
+
         let reason = String::from_str(&env, "I support this because it improves governance");
         client.cast_vote_with_reason(&voter, &proposal_id, &VoteSupport::For, &reason);
 
@@ -2165,7 +2615,7 @@ mod test {
 
         let admin = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
@@ -2213,7 +2663,7 @@ mod test {
 
         let admin = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
         let voter1 = Address::generate(&env);
         let voter2 = Address::generate(&env);
@@ -2233,6 +2683,9 @@ mod test {
         );
 
         let proposal_id = propose_dummy(&env, &client, &proposer);
+
+        // voting_delay = 100: advance past start_ledger so the proposal is Active.
+        env.ledger().with_mut(|l| l.sequence_number += 101);
 
         let reason1 = String::from_str(&env, "I agree with this proposal");
         let reason2 = String::from_str(&env, "I disagree with this proposal");
@@ -2256,7 +2709,7 @@ mod test {
         let client = GovernorContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
@@ -2315,7 +2768,7 @@ mod test {
         let client = GovernorContractClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer1 = Address::generate(&env);
         let proposer2 = Address::generate(&env);
         let proposer3 = Address::generate(&env);
@@ -2391,7 +2844,7 @@ mod test {
         let admin = Address::generate(&env);
         let proposer = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
 
         // Set threshold to 100
         let guardian = Address::generate(&env);
@@ -2451,6 +2904,81 @@ mod test {
     }
 
     #[test]
+    fn test_get_proposal_list_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(GovernorContract, ());
+        let client = GovernorContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let proposer = Address::generate(&env);
+        let votes_token_id = env.register(MockVotesContract, ());
+        let timelock = env.register(MockTimelockContract, ());
+        let guardian = Address::generate(&env);
+
+        client.initialize(
+            &admin,
+            &votes_token_id,
+            &timelock,
+            &100,
+            &1000,
+            &50,
+            &100,
+            &guardian,
+            &VoteType::Extended,
+            &120_960,
+        );
+
+        let p1 = propose_dummy(&env, &client, &proposer);
+        env.ledger().with_mut(|l| l.sequence_number += 101);
+        let p2 = propose_dummy(&env, &client, &proposer);
+        env.ledger().with_mut(|l| l.sequence_number += 101);
+        let p3 = propose_dummy(&env, &client, &proposer);
+
+        let page = client.get_proposal_list(&1, &2);
+
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap().id, p2);
+        assert_eq!(page.get(1).unwrap().id, p3);
+        assert_eq!(p1, 1);
+    }
+
+    #[test]
+    fn test_get_proposal_list_bounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(GovernorContract, ());
+        let client = GovernorContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let proposer = Address::generate(&env);
+        let votes_token_id = env.register(MockVotesContract, ());
+        let timelock = env.register(MockTimelockContract, ());
+        let guardian = Address::generate(&env);
+
+        client.initialize(
+            &admin,
+            &votes_token_id,
+            &timelock,
+            &100,
+            &1000,
+            &50,
+            &100,
+            &guardian,
+            &VoteType::Extended,
+            &120_960,
+        );
+
+        let _ = propose_dummy(&env, &client, &proposer);
+
+        let empty_limit = client.get_proposal_list(&0, &0);
+        let empty_offset = client.get_proposal_list(&10, &5);
+
+        assert_eq!(empty_limit.len(), 0);
+        assert_eq!(empty_offset.len(), 0);
+    }
+
+    #[test]
     #[should_panic]
     fn test_propose_rejects_mismatched_lengths() {
         let env = Env::default();
@@ -2461,7 +2989,7 @@ mod test {
         let admin = Address::generate(&env);
         let proposer = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
 
         let guardian = Address::generate(&env);
         client.initialize(
@@ -2522,7 +3050,7 @@ mod test {
         let admin = Address::generate(&env);
         let proposer = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
 
         let guardian = Address::generate(&env);
         client.initialize(
@@ -2582,7 +3110,7 @@ mod test {
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
 
         client.initialize(
@@ -2616,7 +3144,7 @@ mod test {
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
 
         client.initialize(
@@ -2651,7 +3179,7 @@ mod test {
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
 
         client.initialize(
@@ -2688,7 +3216,7 @@ mod test {
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
 
         client.initialize(
@@ -2721,7 +3249,7 @@ mod test {
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
@@ -2757,7 +3285,7 @@ mod test {
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
@@ -2796,7 +3324,7 @@ mod test {
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
@@ -2845,7 +3373,7 @@ mod test {
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
@@ -2889,7 +3417,7 @@ mod test {
 
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
@@ -2957,8 +3485,14 @@ mod test {
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let mock_votes_client = MockVotesContractClient::new(&env, &votes_token_id);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
+
+        // Deploy a real SEP-41 token so the governor can query its decimals.
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_addr = sac.address();
+        mock_votes_client.set_token(&token_addr);
 
         // 10% static quorum: supply=10_000_000, so static = 1_000_000.
         client.initialize(
@@ -2984,10 +3518,12 @@ mod test {
         // Register the mock oracle ($5.00 per token, 6-decimal format).
         let oracle_id = env.register(MockOracleContract, ());
 
-        // Enable dynamic quorum: min_quorum_usd = 20_000_000 ($20 in 6-decimal),
-        // price = 5_000_000 ($5), so usd_quorum = 20_000_000 / 5_000_000 = 4.
-        // usd_quorum (4) < static_quorum (1_000_000), so static wins.
-        client.update_oracle(&Some(oracle_id.clone()), &20_000_000_i128, &true);
+        // Enable dynamic quorum: min_quorum_usd = 50 ($0.00005 in 6-decimal),
+        // price = 5_000_000 ($5). The correct formula (Issue #622):
+        //   usd_quorum = (min_quorum_usd * 10^decimals) / price
+        //   = (50 * 10^7) / 5_000_000 = 100
+        // usd_quorum (100) < static_quorum (1_000_000), so static wins.
+        client.update_oracle(&Some(oracle_id.clone()), &50_i128, &true);
         let dynamic_q = client.quorum(&proposal_id);
         assert_eq!(
             dynamic_q, 1_000_000,
@@ -2995,12 +3531,12 @@ mod test {
         );
 
         // Now set a very high USD floor that translates to more tokens than static quorum.
-        // usd_quorum = min_quorum_usd / price = 10_000_000_000_000 / 5_000_000 = 2_000_000.
-        // 2_000_000 > static_quorum (1_000_000), so dynamic wins.
+        // usd_quorum = (10_000_000_000_000 * 10^7) / 5_000_000 = 20_000_000_000_000.
+        // 20_000_000_000_000 > static_quorum (1_000_000), so dynamic wins.
         client.update_oracle(&Some(oracle_id.clone()), &10_000_000_000_000_i128, &true);
         let high_dynamic_q = client.quorum(&proposal_id);
         assert_eq!(
-            high_dynamic_q, 2_000_000,
+            high_dynamic_q, 20_000_000_000_000,
             "dynamic quorum should use USD floor when larger than static"
         );
 
@@ -3023,7 +3559,7 @@ mod test {
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
@@ -3073,7 +3609,7 @@ mod test {
         let admin = Address::generate(&env);
         let guardian = Address::generate(&env);
         let votes_token_id = env.register(MockVotesContract, ());
-        let timelock = Address::generate(&env);
+        let timelock = env.register(MockTimelockContract, ());
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
@@ -3100,6 +3636,276 @@ mod test {
 
         // Attempt to vote again should panic
         client.cast_vote(&voter, &proposal_id, &VoteSupport::Against);
+    }
+
+    #[test]
+    fn test_long_running_proposal_ttl_extended() {
+        // Regression test for: Proposal storage TTL not extended — long-running proposals can expire before execution
+        // This test verifies that proposals with long voting periods have their storage TTL extended
+        // to prevent expiration mid-lifecycle.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Bump TTL limits before registering so contract instances don't archive during the test.
+        env.ledger().with_mut(|li| {
+            li.min_persistent_entry_ttl = 1_000_000;
+            li.max_entry_ttl = 1_000_000;
+        });
+
+        let contract_id = env.register(GovernorContract, ());
+        let client = GovernorContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        let votes_token_id = env.register(MockVotesContract, ());
+        let timelock = env.register(MockTimelockContract, ());
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        // Initialize with long voting period: 30 days ≈ 259,200 ledgers (at 10 sec blocks)
+        let long_voting_period = 259_200u32;
+        let voting_delay = 100u32;
+
+        client.initialize(
+            &admin,
+            &votes_token_id,
+            &timelock,
+            &voting_delay,
+            &long_voting_period,
+            &0, // no quorum requirement so single voter can succeed
+            &0, // no proposal threshold
+            &guardian,
+            &VoteType::Extended,
+            &120_960, // grace period
+        );
+
+        env.as_contract(&contract_id, || {
+            env.storage().instance().extend_ttl(300_000, 300_000);
+        });
+        env.as_contract(&votes_token_id, || {
+            env.storage().instance().extend_ttl(300_000, 300_000);
+        });
+
+        // Create proposal — should extend TTL
+        let proposal_id = propose_dummy(&env, &client, &proposer);
+
+        // Verify proposal is created successfully
+        let state = client.state(&proposal_id);
+        assert_eq!(state, ProposalState::Pending);
+
+        // Advance to active state (voting_delay ledgers)
+        env.ledger()
+            .with_mut(|li| li.sequence_number += voting_delay + 1);
+        assert_eq!(client.state(&proposal_id), ProposalState::Active);
+
+        // Cast vote — should extend TTL again
+        client.cast_vote(&voter, &proposal_id, &VoteSupport::For);
+
+        // Verify votes are recorded
+        let (votes_for, _, _) = client.proposal_votes(&proposal_id);
+        assert_eq!(votes_for, 1_000_000);
+
+        // Advance well into the long voting period (but not past end)
+        let mid_voting_period = voting_delay + (long_voting_period / 2);
+        env.ledger()
+            .with_mut(|li| li.sequence_number = mid_voting_period);
+
+        // Should still be Active — if TTL wasn't extended, storage might expire
+        let state = client.state(&proposal_id);
+        assert_eq!(state, ProposalState::Active);
+
+        // Advance to end of voting period
+        env.ledger()
+            .with_mut(|li| li.sequence_number = voting_delay + long_voting_period + 1);
+
+        // Should transition to Succeeded (since quorum was met and votes_for > votes_against)
+        let state = client.state(&proposal_id);
+        assert_eq!(state, ProposalState::Succeeded);
+
+        // Verify that get_proposal still works after long period
+        let proposal = client.get_proposal(&proposal_id);
+        assert_eq!(proposal.votes_for, 1_000_000);
+        assert!(!proposal.executed);
+    }
+
+    #[test]
+    fn test_no_expired_event_when_quorum_met_via_abstain() {
+        // Regression test for the bug where emit_proposal_expired_if_needed checked
+        // only votes_for >= quorum (ignoring abstain), diverging from the canonical
+        // quorum formula in state() which counts votes_for + votes_abstain >= quorum.
+        // A proposal that crosses quorum only because of abstain votes must NOT emit
+        // a ProposalExpired event, and state() must return Succeeded.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(GovernorContract, ());
+        let client = GovernorContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let guardian = Address::generate(&env);
+        let votes_token_id = env.register(MockVotesContract, ());
+        let timelock = env.register(MockTimelockContract, ());
+        let proposer = Address::generate(&env);
+        let voter_for = Address::generate(&env);
+        let voter_abstain = Address::generate(&env);
+
+        // quorum_numerator = 15 → quorum = 10_000_000 * 15 / 100 = 1_500_000.
+        // MockVotesContract returns 1_000_000 per voter, so votes_for (1M) alone
+        // is below quorum but votes_for + votes_abstain (2M) clears it.
+        client.initialize(
+            &admin,
+            &votes_token_id,
+            &timelock,
+            &0,   // voting_delay
+            &100, // voting_period
+            &15,  // quorum_numerator
+            &0,   // proposal_threshold
+            &guardian,
+            &VoteType::Extended,
+            &100, // proposal_grace_period
+        );
+
+        let proposal_id = propose_dummy(&env, &client, &proposer);
+
+        // Advance into the active voting window.
+        env.ledger().with_mut(|li| li.sequence_number += 1);
+
+        client.cast_vote(&voter_for, &proposal_id, &VoteSupport::For);
+        client.cast_vote(&voter_abstain, &proposal_id, &VoteSupport::Abstain);
+
+        // Advance past the voting period; the proposal should be Succeeded because
+        // votes_for (1M) + votes_abstain (1M) = 2M >= quorum (1.5M) and for > against.
+        env.ledger().with_mut(|li| li.sequence_number += 101);
+        assert_eq!(client.state(&proposal_id), ProposalState::Succeeded);
+
+        // Confirm that no ProposalExpired event was emitted.
+        let events = env.events().all();
+        let has_expired_event = events.iter().any(|(_, topics, _)| {
+            !topics.is_empty() && {
+                let first: Result<soroban_sdk::Symbol, _> =
+                    topics.get(0).unwrap().try_into_val(&env);
+                first.is_ok() && first.unwrap() == Symbol::new(&env, "ProposalExpired")
+            }
+        });
+        assert!(
+            !has_expired_event,
+            "ProposalExpired must not be emitted when quorum is met via abstain votes"
+        );
+
+        // The persistent flag must also remain unset so a future state() call
+        // cannot pick up a stale true value.
+        let flag_set: bool = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::ProposalExpiredEmitted(proposal_id))
+                .unwrap_or(false)
+        });
+        assert!(
+            !flag_set,
+            "ProposalExpiredEmitted flag must not be set for a succeeded proposal"
+        );
+    }
+
+    #[test]
+    fn test_governor_error_codes_snapshot() {
+        // Snapshot: each GovernorError variant maps to a stable u32.
+        // If this test fails due to renumbering, update SDK error maps too.
+        assert_eq!(GovernorError::UnauthorizedCancel as u32, 1);
+        assert_eq!(GovernorError::InvalidSupport as u32, 2);
+        assert_eq!(GovernorError::ProposalExpired as u32, 3);
+        assert_eq!(GovernorError::CalldataTooLarge as u32, 4);
+        assert_eq!(GovernorError::InvalidCalldata as u32, 5);
+        assert_eq!(GovernorError::ProposalRateLimited as u32, 6);
+        assert_eq!(GovernorError::ContractPaused as u32, 7);
+        assert_eq!(GovernorError::UnauthorizedPause as u32, 8);
+        assert_eq!(GovernorError::InvalidVectorLengths as u32, 9);
+        assert_eq!(GovernorError::NoTargets as u32, 10);
+        assert_eq!(GovernorError::ProposalThresholdNotMet as u32, 11);
+        assert_eq!(GovernorError::AlreadyVoted as u32, 12);
+        assert_eq!(GovernorError::ZeroVotingPower as u32, 13);
+        assert_eq!(GovernorError::ProposalNotSucceeded as u32, 14);
+        assert_eq!(GovernorError::ProposalNotQueued as u32, 15);
+        assert_eq!(GovernorError::ProposalAlreadyExecuted as u32, 16);
+        assert_eq!(GovernorError::MissingOpIds as u32, 17);
+        assert_eq!(GovernorError::UnauthorizedGuardian as u32, 18);
+        assert_eq!(GovernorError::VetoWindowClosed as u32, 19);
+        assert_eq!(GovernorError::ProposalNotFound as u32, 20);
+        assert_eq!(GovernorError::TimelockNotSet as u32, 21);
+        assert_eq!(GovernorError::GuardianNotSet as u32, 22);
+        assert_eq!(GovernorError::TooManyTokens as u32, 23);
+        assert_eq!(GovernorError::EmptyMetadataUri as u32, 24);
+        assert_eq!(GovernorError::VotesTokenNotSet as u32, 25);
+        assert_eq!(GovernorError::PauserNotSet as u32, 26);
+        assert_eq!(GovernorError::ArithmeticOverflow as u32, 27);
+        assert_eq!(GovernorError::VotePeriodTooShort as u32, 28);
+        assert_eq!(GovernorError::ExecutionWindowZero as u32, 29);
+        assert_eq!(GovernorError::TooManyCalldataEntries as u32, 30);
+        assert_eq!(GovernorError::ProposalNotActive as u32, 31);
+    }
+
+    /// Verify that propose() deletes the previous period's ProposalsInPeriod
+    /// key so stale storage entries don't accumulate (Issue #716).
+    #[test]
+    fn test_proposals_in_period_previous_key_pruned() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(GovernorContract, ());
+        let client = GovernorContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let votes_token_id = env.register(MockVotesContract, ());
+        let timelock = env.register(MockTimelockContract, ());
+        let proposer = Address::generate(&env);
+        let guardian = Address::generate(&env);
+
+        // Initialize at ledger 0 with default period_duration=10_000.
+        client.initialize(
+            &admin,
+            &votes_token_id,
+            &timelock,
+            &0, // voting_delay
+            &1, // voting_period (minimal so proposals don't overlap)
+            &0, // quorum_numerator
+            &0, // proposal_threshold
+            &guardian,
+            &VoteType::Simple,
+            &120_960,
+        );
+
+        // Override period_duration to 5 so we can advance cheaply.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::ProposalPeriodDuration, &5u32);
+            // Disable cooldown so a second proposal is immediately allowed.
+            env.storage()
+                .instance()
+                .set(&DataKey::ProposalCooldown, &0u32);
+        });
+
+        // Submit one proposal at ledger 0 (period 0).
+        propose_dummy(&env, &client, &proposer);
+        assert_eq!(client.proposals_in_period(&proposer), 1);
+
+        // Advance to period 1 (ledger 5).  This is a small jump that won't
+        // cause the instance key to be treated as archived.
+        env.ledger().with_mut(|li| li.sequence_number = 5);
+
+        // Submit a proposal in period 1 — this should prune the period-0 key.
+        propose_dummy(&env, &client, &proposer);
+
+        // The period-0 key must have been removed.
+        let period0_key = DataKey::ProposalsInPeriod(proposer.clone(), 0u32);
+        let stale_still_exists = env.as_contract(&contract_id, || {
+            env.storage().persistent().has(&period0_key)
+        });
+        assert!(
+            !stale_still_exists,
+            "stale ProposalsInPeriod key for period 0 should have been pruned"
+        );
+
+        // The current period-1 count must be 1.
+        assert_eq!(client.proposals_in_period(&proposer), 1);
     }
 }
 
