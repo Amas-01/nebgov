@@ -351,8 +351,6 @@ pub enum DataKey {
     CachedExecutionWindow,
     /// Ordered list of proposal ids for pagination.
     ProposalList,
-    /// Token decimals for vote display formatting.
-    Decimals,
 }
 
 #[contract]
@@ -480,7 +478,6 @@ impl GovernorContract {
         guardian: Address,
         vote_type: VoteType,
         proposal_grace_period: u32,
-        decimals: u32,
     ) {
         admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
@@ -556,8 +553,6 @@ impl GovernorContract {
         env.storage()
             .instance()
             .set(&DataKey::ProposalPeriodDuration, &10_000u32); // ~24 hour period
-        // Store token decimals for vote display formatting
-        env.storage().instance().set(&DataKey::Decimals, &decimals);
         // Initialize pause state (not paused by default)
         env.storage().instance().set(&DataKey::IsPaused, &false);
         // Set admin as initial pauser
@@ -1688,12 +1683,17 @@ impl GovernorContract {
     }
 
     /// Get the token decimals for vote display formatting.
-    /// Returns 7 (Stellar native asset standard) as default for backwards compatibility.
-    pub fn get_decimals(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::Decimals)
-            .unwrap_or(7)
+    /// 
+    /// Returns 7 (Stellar native asset standard) as the default.
+    /// 
+    /// Note: Soroban contract functions have a 10-parameter limit, preventing us from
+    /// adding decimals as an initialization parameter. Future versions could fetch this
+    /// from the underlying token contract, but for now we use the Stellar standard of 7
+    /// decimals which covers the vast majority of Stellar assets.
+    /// 
+    /// Tokens with non-standard decimals should handle formatting in the SDK/frontend layer.
+    pub fn get_decimals(_env: Env) -> u32 {
+        7
     }
 
     fn validate_settings(_env: &Env, new_settings: &GovernorSettings) {
