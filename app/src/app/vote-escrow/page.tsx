@@ -1,9 +1,31 @@
 "use client";
 
 import { useState } from "react";
-import { useWallet } from "@/lib/wallet-context";
-import { useVoteEscrow } from "@/hooks/useVoteEscrow";
-import { LockCard } from "@/components/LockCard";
+import { useWallet } from "../../lib/wallet-context";
+import { useVoteEscrow } from "../../hooks/useVoteEscrow";
+import { LockCard } from "../../components/LockCard";
+
+type PreviewLock = {
+  amount: bigint;
+  start_ledger: number;
+  end_ledger: number;
+  initial_voting_power: bigint;
+};
+
+function computeDecayedPowerPreview(lock: PreviewLock, currentLedger: number): bigint {
+  // Mirrors contracts/vote-escrow/src/lib.rs `compute_decayed_power` (lines 552-579).
+  if (currentLedger >= lock.end_ledger) return lock.amount;
+  if (currentLedger < lock.start_ledger) return 0n;
+
+  const duration = BigInt(lock.end_ledger - lock.start_ledger);
+  if (duration === 0n) return lock.amount;
+
+  const remaining = BigInt(lock.end_ledger - currentLedger);
+  const boost = lock.initial_voting_power - lock.amount;
+  const decayedBoost = (boost * remaining) / duration;
+
+  return lock.amount + decayedBoost;
+}
 
 export default function VoteEscrowPage() {
   const { publicKey } = useWallet();
@@ -12,6 +34,11 @@ export default function VoteEscrowPage() {
   const [amount, setAmount] = useState("");
   const [duration, setDuration] = useState("");
   const [activeTab, setActiveTab] = useState<"create" | "manage">("create");
+
+  const initialVotingPowerPreview =
+    lock !== null ? computeDecayedPowerPreview(lock, lock.start_ledger) : null;
+  const maturityVotingPowerPreview =
+    lock !== null ? computeDecayedPowerPreview(lock, lock.end_ledger) : null;
 
   return (
     <div className="space-y-8 py-12">
@@ -89,8 +116,20 @@ export default function VoteEscrowPage() {
                       <span className="font-semibold">{duration} ledgers</span>
                     </p>
                     <p className="text-sm text-blue-800 dark:text-blue-300">
-                      After unlock, your voting power will decay linearly over the lock period
+                      Your voting boost decays linearly during the lock, from the initial
+                      boosted power at lock start down to your base amount at maturity. After
+                      withdrawal, voting power becomes zero.
                     </p>
+                    {lock && initialVotingPowerPreview !== null && maturityVotingPowerPreview !== null && (
+                      <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                        <p className="text-xs text-blue-800 dark:text-blue-300">
+                          Initial voting power: <span className="font-semibold">{initialVotingPowerPreview.toString()}</span>
+                        </p>
+                        <p className="text-xs text-blue-800 dark:text-blue-300">
+                          Voting power at maturity: <span className="font-semibold">{maturityVotingPowerPreview.toString()}</span>
+                        </p>
+                      </div>
+                    )}
                   </div>
                 )}
 

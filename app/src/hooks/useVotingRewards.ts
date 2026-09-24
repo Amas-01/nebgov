@@ -218,11 +218,17 @@ export function useClaimableRewards(address: string | null) {
   };
 }
 
-/** Top earners for one epoch. */
+/**
+ * Top earners for one epoch.
+ *
+ * Returns `refetch` so callers can refresh the claimed/unclaimed flags
+ * immediately after successful reward claims.
+ */
 export function useEpochLeaderboard(epochId: bigint | null, limit = 10) {
   const [rows, setRows] = useState<LeaderboardRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [refetchToken, setRefetchToken] = useState(0);
 
   useEffect(() => {
     if (epochId === null) {
@@ -258,7 +264,12 @@ export function useEpochLeaderboard(epochId: bigint | null, limit = 10) {
     return () => {
       cancelled = true;
     };
-  }, [epochId, limit]);
+  }, [epochId, limit, refetchToken]);
 
-  return { rows, loading, error };
+  return {
+    rows,
+    loading,
+    error,
+    refetch: useCallback(() => setRefetchToken((t) => t + 1), []),
+  };
 }
