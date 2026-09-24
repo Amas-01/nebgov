@@ -28,11 +28,16 @@ function computeDecayedPowerPreview(lock: PreviewLock, currentLedger: number): b
 }
 
 export default function VoteEscrowPage() {
-  const { publicKey } = useWallet();
+  const { publicKey: pk, connect, signTransaction } = useWallet();
   const { lock, votingPower, stats, loading, error } = useVoteEscrow(publicKey);
 
   const [amount, setAmount] = useState("");
   const [duration, setDuration] = useState("");
+  const [errors, setErrors] = useState<{ amount?: string; duration?: string }>({});
+  const { divisor } = useGovernorConfig();
+  const MIN_LOCK = Number(process.env.NEXT_PUBLIC_MIN_LOCK_DURATION || 0);
+  const MAX_LOCK = Number(process.env.NEXT_PUBLIC_MAX_LOCK_DURATION || 99999999);
+  const [busy, setBusy] = useState(false);
   const [activeTab, setActiveTab] = useState<"create" | "manage">("create");
 
   const initialVotingPowerPreview =
@@ -88,12 +93,17 @@ export default function VoteEscrowPage() {
                     Amount
                   </label>
                   <input
-                    type="number"
+                    type="text"
                     value={amount}
                     onChange={(e) => setAmount(e.target.value)}
+                    onBlur={() => {
+                      const parsed = parseDecimalToStroops(amount, divisor);
+                      setErrors((s) => ({ ...s, amount: parsed instanceof Error ? parsed.message : undefined }));
+                    }}
                     placeholder="Enter amount to lock"
                     className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 text-gray-900 placeholder-gray-500 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-50 dark:placeholder-gray-400"
                   />
+                  {errors.amount && <p className="mt-1 text-sm text-red-600">{errors.amount}</p>}
                 </div>
 
                 <div>
@@ -103,10 +113,19 @@ export default function VoteEscrowPage() {
                   <input
                     type="number"
                     value={duration}
-                    onChange={(e) => setDuration(e.target.value)}
+                    onChange={(e) => {
+                      setDuration(e.target.value);
+                      const n = Number(e.target.value || 0);
+                      let msg: string | undefined;
+                      if (!Number.isFinite(n) || n <= 0) msg = "Duration must be a positive integer";
+                      else if (n < MIN_LOCK) msg = `Minimum duration is ${MIN_LOCK} ledgers`;
+                      else if (n > MAX_LOCK) msg = `Maximum duration is ${MAX_LOCK} ledgers`;
+                      setErrors((s) => ({ ...s, duration: msg }));
+                    }}
                     placeholder="Enter lock duration in ledgers"
                     className="mt-1 w-full rounded-lg border border-gray-300 px-4 py-2 text-gray-900 placeholder-gray-500 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-50 dark:placeholder-gray-400"
                   />
+                  {errors.duration && <p className="mt-1 text-sm text-red-600">{errors.duration}</p>}
                 </div>
 
                 {amount && duration && (
@@ -133,8 +152,50 @@ export default function VoteEscrowPage() {
                   </div>
                 )}
 
-                <button className="w-full rounded-lg bg-blue-600 px-4 py-2 font-medium text-white transition-colors hover:bg-blue-700 dark:bg-blue-600 dark:hover:bg-blue-700">
-                  Create Lock
+                <button
+                  onClick={async () => {
+                    if (!pk) {
+                      await connect();
+                      return;
+                    }
+                    const client = buildVoteEscrowClient();
+                    if (!client) {
+                      toast.error("Vote escrow is not configured for this deployment.");
+                      return;
+                    }
+
+                    const parsed = parseDecimalToStroops(amount, divisor);
+                    if (parsed instanceof Error) {
+                      setErrors((s) => ({ ...s, amount: parsed.message }));
+                      return;
+                    }
+                    const dur = Number(duration || 0);
+                    if (!Number.isInteger(dur) || dur <= 0) {
+                      setErrors((s) => ({ ...s, duration: "Invalid duration" }));
+                      return;
+                    }
+                    if (errors.amount || errors.duration) return;
+
+                    setBusy(true);
+                    try {
+                      const hash = await client.createLockWithSign(pk, parsed, dur, signTransaction);
+                      toast.success(
+                        <span>
+                          Lock created — <a className="underline" href={`https://explorer.stellar.org/tx/${hash}`}>view</a>
+                        </span>,
+                      );
+                      setAmount("");
+                      setDuration("");
+                    } catch (e: unknown) {
+                      toast.error(e instanceof Error ? e.message : "Create lock failed");
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                  disabled={busy}
+                  className="w-full rounded-lg bg-blue-600 px-4 py-2 font-medium text-white transition-colors hover:bg-blue-700 dark:bg-blue-600 dark:hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {busy ? "Creating…" : "Create Lock"}
                 </button>
               </div>
             )}
@@ -146,14 +207,102 @@ export default function VoteEscrowPage() {
                     <p className="text-sm text-gray-600 dark:text-gray-400">
                       Manage your existing lock below
                     </p>
-                    <button className="w-full rounded-lg bg-green-600 px-4 py-2 font-medium text-white transition-colors hover:bg-green-700 dark:bg-green-600 dark:hover:bg-green-700">
-                      Increase Amount
+                    <button
+                      onClick={async () => {
+                        if (!pk) {
+                          await connect();
+                          return;
+                        }
+                        const client = buildVoteEscrowClient();
+                        if (!client) {
+                          toast.error("Vote escrow is not configured for this deployment.");
+                          return;
+                        }
+                        setBusy(true);
+                        try {
+                          const hash = await client.increaseLockAmountWithSign(
+                            pk,
+                            BigInt(amount || "0"),
+                            signTransaction,
+                          );
+                          toast.success(
+                            <span>
+                              Increased — <a className="underline" href={`https://explorer.stellar.org/tx/${hash}`}>view</a>
+                            </span>,
+                          );
+                        } catch (e: unknown) {
+                          toast.error(e instanceof Error ? e.message : "Increase failed");
+                        } finally {
+                          setBusy(false);
+                        }
+                      }}
+                      disabled={busy}
+                      className="w-full rounded-lg bg-green-600 px-4 py-2 font-medium text-white transition-colors hover:bg-green-700 dark:bg-green-600 dark:hover:bg-green-700 disabled:opacity-50"
+                    >
+                      {busy ? "Processing…" : "Increase Amount"}
                     </button>
-                    <button className="w-full rounded-lg bg-purple-600 px-4 py-2 font-medium text-white transition-colors hover:bg-purple-700 dark:bg-purple-600 dark:hover:bg-purple-700">
-                      Extend Lock
+
+                    <button
+                      onClick={async () => {
+                        if (!pk) {
+                          await connect();
+                          return;
+                        }
+                        const client = buildVoteEscrowClient();
+                        if (!client) {
+                          toast.error("Vote escrow is not configured for this deployment.");
+                          return;
+                        }
+                        setBusy(true);
+                        try {
+                          const newEnd = Number(duration || 0);
+                          const hash = await client.extendLockWithSign(pk, newEnd, signTransaction);
+                          toast.success(
+                            <span>
+                              Extended — <a className="underline" href={`https://explorer.stellar.org/tx/${hash}`}>view</a>
+                            </span>,
+                          );
+                        } catch (e: unknown) {
+                          toast.error(e instanceof Error ? e.message : "Extend failed");
+                        } finally {
+                          setBusy(false);
+                        }
+                      }}
+                      disabled={busy}
+                      className="w-full rounded-lg bg-purple-600 px-4 py-2 font-medium text-white transition-colors hover:bg-purple-700 dark:bg-purple-600 dark:hover:bg-purple-700 disabled:opacity-50"
+                    >
+                      {busy ? "Processing…" : "Extend Lock"}
                     </button>
-                    <button className="w-full rounded-lg bg-orange-600 px-4 py-2 font-medium text-white transition-colors hover:bg-orange-700 dark:bg-orange-600 dark:hover:bg-orange-700">
-                      Withdraw
+
+                    <button
+                      onClick={async () => {
+                        if (!pk) {
+                          await connect();
+                          return;
+                        }
+                        const client = buildVoteEscrowClient();
+                        if (!client) {
+                          toast.error("Vote escrow is not configured for this deployment.");
+                          return;
+                        }
+                        setBusy(true);
+                        try {
+                          const hash = await client.withdrawWithSign(pk, signTransaction);
+                          toast.success(
+                            <span>
+                              Withdrawn — <a className="underline" href={`https://explorer.stellar.org/tx/${hash}`}>view</a>
+                            </span>,
+                          );
+                        } catch (e: unknown) {
+                          toast.error(e instanceof Error ? e.message : "Withdraw failed");
+                        } finally {
+                          setBusy(false);
+                        }
+                      }}
+                      disabled={busy}
+                      className="w-full rounded-lg bg-orange-600 px-4 py-2 font-medium text-white transition-colors hover:bg-orange-700 dark:bg-orange-600 dark:hover:bg-orange-700 disabled:opacity-50"
+                    >
+                      {busy ? "Processing…" : "Withdraw"}
                     </button>
                   </>
                 ) : (
