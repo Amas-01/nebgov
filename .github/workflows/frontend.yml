@@ -5,11 +5,16 @@ on:
     branches: [ main, develop ]
     paths:
       - 'app/**'
+      - 'sdk/**'
+      - 'pnpm-lock.yaml'
       - '.github/workflows/frontend.yml'
   pull_request:
     branches: [ main, develop ]
     paths:
       - 'app/**'
+      - 'sdk/**'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/frontend.yml'
 
 jobs:
   build:
@@ -48,6 +53,9 @@ jobs:
 
       - name: Type check
         run: pnpm tsc --noEmit
+
+      - name: Test
+        run: pnpm test -- --ci
 
       - name: Build
         env:

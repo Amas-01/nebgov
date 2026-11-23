@@ -32,6 +32,8 @@ export default function ConvictionProposalPage() {
     ]).then(([nextProposal, nextHistory]) => {
       setProposal(nextProposal as Record<string, unknown>);
       setHistory(((nextHistory as { data?: Record<string, unknown>[] }).data ?? []).map((row) => ({ ledger: Number(row.ledger), conviction: BigInt(String(row.conviction)) })));
+    }).catch((err: unknown) => {
+      console.error(err);
     });
   };
 
