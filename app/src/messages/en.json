@@ -203,5 +203,27 @@
     "metadataUnreachable": "Metadata Unreachable",
     "onChain": "On-chain",
     "hash": "Hash"
+  },
+  "signals": {
+    "title": "Signals",
+    "newSignal": "New signal",
+    "description": "Gasless temperature checks — signal your support before a formal on-chain proposal costs anyone a transaction fee. Signing is free; results are weighted by real voting power.",
+    "active": "Active",
+    "closed": "Closed",
+    "closedLabel": "closed",
+    "loading": "Loading signals…",
+    "noActive": "No active signals right now.",
+    "noClosed": "No closed signals yet.",
+    "pollMeta": "{count} choices · by {creator}",
+    "ended": "ended",
+    "daysLeft": "{count}d left",
+    "hoursLeft": "{count}h left",
+    "minutesLeft": "{count}m left",
+    "anchor": {
+      "mismatch": "Anchor mismatch",
+      "mismatchTitle": "The published result hash does not match the on-chain anchor.",
+      "verified": "Anchor verified",
+      "verifiedTitle": "This poll's result hash matches its on-chain anchor — it cannot have been edited after publication."
+    }
   }
 }

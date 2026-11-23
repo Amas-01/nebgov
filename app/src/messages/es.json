@@ -203,5 +203,27 @@
     "metadataUnreachable": "Metadata Unreachable",
     "onChain": "On-chain",
     "hash": "Hash"
+  },
+  "signals": {
+    "title": "Señales",
+    "newSignal": "Nueva señal",
+    "description": "Consultas de temperatura sin gas — muestra tu apoyo antes de que una propuesta formal on-chain le cueste una comisión de transacción a alguien. Firmar es gratis; los resultados se ponderan por poder de voto real.",
+    "active": "Activas",
+    "closed": "Cerradas",
+    "closedLabel": "cerrada",
+    "loading": "Cargando señales…",
+    "noActive": "No hay señales activas ahora mismo.",
+    "noClosed": "Aún no hay señales cerradas.",
+    "pollMeta": "{count} opciones · por {creator}",
+    "ended": "finalizada",
+    "daysLeft": "quedan {count} d",
+    "hoursLeft": "quedan {count} h",
+    "minutesLeft": "quedan {count} min",
+    "anchor": {
+      "mismatch": "Ancla no coincide",
+      "mismatchTitle": "El hash del resultado publicado no coincide con el ancla on-chain.",
+      "verified": "Ancla verificada",
+      "verifiedTitle": "El hash del resultado de esta encuesta coincide con su ancla on-chain — no se pudo haber editado después de su publicación."
+    }
   }
 }
