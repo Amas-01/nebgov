@@ -1,0 +1,61 @@
+{
+  "name": "treasury_streams",
+  "description": "Recurring treasury payments: a multi-interval stream with a pause/resume span (intervals that come due while paused are paid on resume), a short stream that completes, and a 30-stream active list that exercises get_active_streams as the list changes",
+  "seed": 6,
+  "governor_settings": {
+    "voting_delay": 1,
+    "voting_period": 10,
+    "quorum_numerator": 10,
+    "proposal_threshold": 100,
+    "vote_type": "Extended",
+    "proposal_grace_period": 1000,
+    "max_calldata_size": 10000,
+    "proposal_cooldown": 0,
+    "max_proposals_per_period": 5,
+    "proposal_period_duration": 10000
+  },
+  "actors": [
+    { "name": "bob", "initial_balance": 0, "delegate_to": null, "role": "TokenHolder" },
+    { "name": "carol", "initial_balance": 0, "delegate_to": null, "role": "TokenHolder" }
+  ],
+  "steps": [
+    { "type": "FundStreams", "amount": 100000 },
+    { "type": "CreateStream", "recipient": "bob", "amount_per_interval": 100, "interval_ledgers": 10, "start_ledger": 1, "end_ledger": 101 },
+    { "type": "AdvanceLedger", "ledgers": 10 },
+    { "type": "ExecuteStream", "stream_id": 1 },
+    { "type": "ExpectStream", "stream_id": 1, "total_streamed": 100, "last_streamed_ledger": 11, "paused": false, "cancelled": false, "completed": false },
+    { "type": "AdvanceLedger", "ledgers": 10 },
+    { "type": "ExecuteStream", "stream_id": 1 },
+    { "type": "ExpectStream", "stream_id": 1, "total_streamed": 200, "last_streamed_ledger": 21, "paused": false, "cancelled": false, "completed": false },
+
+    { "type": "PauseStream", "stream_id": 1 },
+    { "type": "AdvanceLedger", "ledgers": 20 },
+    { "type": "ExecuteStream", "stream_id": 1 },
+    { "type": "ExpectStream", "stream_id": 1, "total_streamed": 200, "last_streamed_ledger": 21, "paused": true, "cancelled": false, "completed": false },
+    { "type": "ResumeStream", "stream_id": 1 },
+    { "type": "ExecuteStream", "stream_id": 1 },
+    { "type": "ExpectStream", "stream_id": 1, "total_streamed": 400, "last_streamed_ledger": 41, "paused": false, "cancelled": false, "completed": false },
+    { "type": "ExpectTokenBalance", "actor": "bob", "balance": 400 },
+
+    { "type": "CreateStream", "recipient": "bob", "amount_per_interval": 50, "interval_ledgers": 5, "start_ledger": 41, "end_ledger": 51 },
+    { "type": "AdvanceLedger", "ledgers": 10 },
+    { "type": "ExecuteStream", "stream_id": 2 },
+    { "type": "ExpectStream", "stream_id": 2, "total_streamed": 100, "last_streamed_ledger": 51, "paused": false, "cancelled": false, "completed": true },
+    { "type": "ExpectTokenBalance", "actor": "bob", "balance": 500 },
+    { "type": "ExpectActiveStreams", "count": 1 },
+
+    { "type": "CreateStream", "count": 30, "recipient": "carol", "amount_per_interval": 10, "interval_ledgers": 10, "start_ledger": 51, "end_ledger": 1000 },
+    { "type": "ExpectActiveStreams", "count": 31 },
+    { "type": "CancelStream", "stream_id": 1 },
+    { "type": "ExpectActiveStreams", "count": 30 },
+    { "type": "ExpectStream", "stream_id": 1, "total_streamed": 400, "last_streamed_ledger": 41, "paused": false, "cancelled": true, "completed": false },
+
+    { "type": "AdvanceLedger", "ledgers": 60 },
+    { "type": "ExecuteStream", "stream_id": 3 },
+    { "type": "ExpectStream", "stream_id": 3, "total_streamed": 60, "last_streamed_ledger": 111, "paused": false, "cancelled": false, "completed": false },
+    { "type": "ExpectTokenBalance", "actor": "carol", "balance": 60 },
+    { "type": "ExpectActiveStreams", "count": 30 },
+
+    { "type": "ExpectError", "step_index": 10, "expected_error": "Error(Contract, #9)" }
+  ]
+}

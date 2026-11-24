@@ -17,6 +17,8 @@ fn base_settings() -> SimGovernorSettings {
         proposal_cooldown: 0,
         max_proposals_per_period: 5,
         proposal_period_duration: 10_000,
+        use_commit_reveal: false,
+        commit_phase_fraction: 5_000,
     }
 }
 
@@ -507,6 +509,38 @@ fn test_voting_rewards_scenario_passes() {
 
     assert_eq!(report.total_steps, scenario.steps.len());
     assert_eq!(report.failed_steps, 0, "steps: {:#?}", report.step_results);
+}
+
+fn run_shipped_scenario(file_name: &str) -> crate::report::SimulationReport {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/scenarios")
+        .join(file_name);
+    let scenario = Scenario::from_file(&path).expect("shipped scenario parses");
+    scenario.validate().expect("shipped scenario is valid");
+
+    let mut runner = SimulationRunner::new(&scenario);
+    runner.run();
+    runner.check_expect_errors();
+    let report = runner.get_report().clone();
+
+    assert_eq!(report.total_steps, scenario.steps.len());
+    assert_eq!(report.failed_steps, 0, "steps: {:#?}", report.step_results);
+    report
+}
+
+#[test]
+fn test_commit_reveal_scenario_passes() {
+    run_shipped_scenario("commit_reveal.json");
+}
+
+#[test]
+fn test_guardian_council_scenario_passes() {
+    run_shipped_scenario("guardian_council.json");
+}
+
+#[test]
+fn test_treasury_streams_scenario_passes() {
+    run_shipped_scenario("treasury_streams.json");
 }
 
 #[test]

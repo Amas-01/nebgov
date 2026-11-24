@@ -904,6 +904,7 @@ dependencies = [
  "sorogov-co-sponsorship",
  "sorogov-conviction-voting",
  "sorogov-governor",
+ "sorogov-guardian-council",
  "sorogov-liquidity",
  "sorogov-proposal-bonds",
  "sorogov-signal-anchor",
@@ -911,6 +912,7 @@ dependencies = [
  "sorogov-token-votes",
  "sorogov-treasury",
  "sorogov-treasury-strategies",
+ "sorogov-treasury-streams",
  "sorogov-vote-escrow",
  "sorogov-voting-rewards",
 ]
@@ -1499,6 +1501,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sorogov-guardian-council"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "sorogov-liquidity"
 version = "0.1.0"
 dependencies = [
@@ -1542,6 +1551,13 @@ dependencies = [
 
 [[package]]
 name = "sorogov-treasury-strategies"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
+name = "sorogov-treasury-streams"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",

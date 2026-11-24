@@ -11,6 +11,7 @@ export function mockSdk(): Record<string, unknown> {
     TreasuryClient: jest.fn(),
     FactoryClient: jest.fn(),
     GuardianCouncilClient: jest.fn(),
+    AmendmentsClient: jest.fn(),
     ProposalBondsClient: jest.fn(),
     OptimisticGovernorClient: jest.fn(),
     ConvictionVotingClient: jest.fn(),

@@ -30,6 +30,9 @@ use sorogov_governor::{
     GovernorContract, GovernorContractClient, GovernorSettings, ProposalState, VoteSupport,
     VoteType,
 };
+use sorogov_guardian_council::{
+    GuardianAction, GuardianCouncilContract, GuardianCouncilContractClient, MemberRotation,
+};
 use sorogov_liquidity::{LiquidityContract, LiquidityContractClient, Pool};
 use sorogov_proposal_bonds::{BondState, ProposalBondsContract, ProposalBondsContractClient};
 use sorogov_signal_anchor::{SignalAnchorContract, SignalAnchorContractClient};
@@ -38,13 +41,14 @@ use sorogov_token_votes::{TokenVotesContract, TokenVotesContractClient};
 use sorogov_treasury::{TreasuryContract, TreasuryContractClient};
 use sorogov_treasury_strategies::adapters::mock_adapter::MockAdapter;
 use sorogov_treasury_strategies::{TreasuryStrategiesContract, TreasuryStrategiesContractClient};
+use sorogov_treasury_streams::{TreasuryStreamsContract, TreasuryStreamsContractClient};
 use sorogov_vote_escrow::{VoteEscrowContract, VoteEscrowContractClient};
 use sorogov_voting_rewards::{merkle, VotingRewardsContract, VotingRewardsContractClient};
 
 use crate::report::{SimulationReport, StepResult};
 use crate::scenario::{
-    ActorRole, Scenario, SimBondState, SimGovernorSettings, SimPoolAsset, SimProposalState,
-    SimStep, SimVoteSupport, SimVoteType,
+    ActorRole, Scenario, SimBondState, SimCouncilAction, SimGovernorSettings, SimPoolAsset,
+    SimProposalState, SimStep, SimVoteSupport, SimVoteType,
 };
 
 /// A no-op target contract used to resolve `SimStep::Propose` targets that
@@ -108,6 +112,10 @@ pub struct SimulationRunner {
     treasury_strategies_admin: Address,
     strategy_adapter: Address,
     proposal_bonds_addr: Address,
+    treasury_streams: TreasuryStreamsContractClient<'static>,
+    /// Set by `SimStep::DeployGuardianCouncil`; the council is the governor's
+    /// guardian from that step onward.
+    guardian_council: Option<Address>,
     actors: HashMap<String, Address>,
     report: SimulationReport,
     batch_op_ids: Vec<Option<soroban_sdk::Bytes>>,
@@ -194,6 +202,12 @@ impl SimulationRunner {
         treasury_strategies.initialize(&admin, &treasury_id);
         let strategy_adapter = env.register(MockAdapter, ());
 
+        // The treasury pauses, resumes and cancels streams; only the governor
+        // creates them.
+        let treasury_streams_id = env.register(TreasuryStreamsContract, ());
+        let treasury_streams = TreasuryStreamsContractClient::new(&env, &treasury_streams_id);
+        treasury_streams.initialize(&treasury_id, &governor_id);
+
         let co_sponsorship_id = env.register(CoSponsorshipContract, ());
         let co_sponsorship = CoSponsorshipContractClient::new(&env, &co_sponsorship_id);
         co_sponsorship.initialize(
@@ -205,6 +219,8 @@ impl SimulationRunner {
         );
         let mut governor_settings = governor.get_settings();
         governor_settings.co_sponsorship_registry = Some(co_sponsorship_id);
+        governor_settings.use_commit_reveal = scenario.governor_settings.use_commit_reveal;
+        governor_settings.commit_phase_fraction = scenario.governor_settings.commit_phase_fraction;
         governor.update_config(&governor_settings);
 
         let conviction_voting_id = env.register(ConvictionVotingContract, ());
@@ -300,10 +316,20 @@ impl SimulationRunner {
             treasury_strategies_admin: admin,
             strategy_adapter,
             proposal_bonds_addr: proposal_bonds_id,
+            treasury_streams,
+            guardian_council: None,
             actors,
             report,
             batch_op_ids: Vec::new(),
         }
+    }
+
+    fn council_client(&self) -> GuardianCouncilContractClient<'static> {
+        let council = self
+            .guardian_council
+            .as_ref()
+            .expect("no guardian council deployed; add a DeployGuardianCouncil step first");
+        GuardianCouncilContractClient::new(&self.env, council)
     }
 
     pub fn get_actor(&self, name: &str) -> &Address {
@@ -1235,6 +1261,226 @@ impl SimulationRunner {
                     );
                 }
             }
+            SimStep::CommitVote {
+                actor,
+                proposal_id,
+                support,
+                weight_seed,
+                salt,
+            } => {
+                let voter = self.get_actor(actor).clone();
+                let vote = sim_vote_support(*support);
+                let salt: BytesN<32> = BytesN::from_array(&self.env, &[*salt; 32]);
+                let commitment = commit_hash(
+                    &self.env,
+                    *proposal_id,
+                    &vote,
+                    *weight_seed as u128,
+                    &salt,
+                );
+                self.governor.commit_vote(&voter, proposal_id, &commitment);
+            }
+            SimStep::RevealVote {
+                actor,
+                proposal_id,
+                support,
+                weight_seed,
+                salt,
+            } => {
+                let voter = self.get_actor(actor).clone();
+                let vote = sim_vote_support(*support);
+                let salt: BytesN<32> = BytesN::from_array(&self.env, &[*salt; 32]);
+                self.governor.reveal_vote(
+                    &voter,
+                    proposal_id,
+                    &vote,
+                    &(*weight_seed as u128),
+                    &salt,
+                );
+            }
+            SimStep::ExpectTally {
+                proposal_id,
+                votes_for,
+                votes_against,
+                votes_abstain,
+            } => {
+                let proposal = self.governor.get_proposal(proposal_id);
+                if proposal.votes_for != *votes_for
+                    || proposal.votes_against != *votes_against
+                    || proposal.votes_abstain != *votes_abstain
+                {
+                    panic!(
+                        "expected proposal #{} tally for/against/abstain {}/{}/{}, was {}/{}/{}",
+                        proposal_id,
+                        votes_for,
+                        votes_against,
+                        votes_abstain,
+                        proposal.votes_for,
+                        proposal.votes_against,
+                        proposal.votes_abstain
+                    );
+                }
+            }
+            SimStep::DeployGuardianCouncil {
+                members,
+                threshold,
+                action_ttl_ledgers,
+            } => {
+                // Deployer is the harness admin, the same address that
+                // initialized the governor.
+                let deployer = self.treasury_strategies_admin.clone();
+                let council = self
+                    .env
+                    .register(GuardianCouncilContract, (deployer.clone(),));
+                let member_addrs: SorobanVec<Address> = {
+                    let mut v = SorobanVec::new(&self.env);
+                    for name in members {
+                        v.push_back(self.get_actor(name).clone());
+                    }
+                    v
+                };
+                let governor_addr = self.governor.address.clone();
+                GuardianCouncilContractClient::new(&self.env, &council).initialize(
+                    &deployer,
+                    &member_addrs,
+                    threshold,
+                    &governor_addr,
+                    action_ttl_ledgers,
+                );
+                // `set_guardian` requires the governor's own auth, which the
+                // harness's mocked auths satisfy.
+                self.governor.set_guardian(&council);
+                self.guardian_council = Some(council);
+            }
+            SimStep::CouncilPropose { actor, action } => {
+                let proposer = self.get_actor(actor).clone();
+                let guardian_action = match action {
+                    SimCouncilAction::CancelActive { proposal_id } => {
+                        GuardianAction::CancelActive(*proposal_id)
+                    }
+                    SimCouncilAction::RotateMember {
+                        old_member,
+                        new_member,
+                    } => GuardianAction::RotateMember(MemberRotation {
+                        old: self.get_actor(old_member).clone(),
+                        new: self.get_actor(new_member).clone(),
+                    }),
+                };
+                self.council_client()
+                    .propose_action(&proposer, &guardian_action);
+            }
+            SimStep::CouncilApprove { actor, action_id } => {
+                let member = self.get_actor(actor).clone();
+                self.council_client().approve_action(&member, action_id);
+            }
+            SimStep::CouncilExecute { action_id } => {
+                self.council_client().execute_action(action_id);
+            }
+            SimStep::ExpectCouncilAction {
+                action_id,
+                approvals,
+                executed,
+            } => {
+                let action = self.council_client().get_action(action_id);
+                if action.approvals.len() != *approvals || action.executed != *executed {
+                    panic!(
+                        "expected council action #{} to have {} stored approvals and executed={}, was {} and executed={}",
+                        action_id,
+                        approvals,
+                        executed,
+                        action.approvals.len(),
+                        action.executed
+                    );
+                }
+            }
+            SimStep::CreateStream {
+                count,
+                recipient,
+                amount_per_interval,
+                interval_ledgers,
+                start_ledger,
+                end_ledger,
+            } => {
+                let requester = self.governor.address.clone();
+                let recipient_addr = self.get_actor(recipient).clone();
+                for _ in 0..*count {
+                    self.treasury_streams.create_stream(
+                        &requester,
+                        &recipient_addr,
+                        &self.token,
+                        amount_per_interval,
+                        interval_ledgers,
+                        start_ledger,
+                        end_ledger,
+                    );
+                }
+            }
+            SimStep::ExecuteStream { stream_id } => {
+                self.treasury_streams.execute_stream(stream_id);
+            }
+            SimStep::PauseStream { stream_id } => {
+                let treasury = self.treasury_addr.clone();
+                self.treasury_streams.pause_stream(&treasury, stream_id);
+            }
+            SimStep::ResumeStream { stream_id } => {
+                let treasury = self.treasury_addr.clone();
+                self.treasury_streams.resume_stream(&treasury, stream_id);
+            }
+            SimStep::CancelStream { stream_id } => {
+                let treasury = self.treasury_addr.clone();
+                self.treasury_streams.cancel_stream(&treasury, stream_id);
+            }
+            SimStep::ExpectStream {
+                stream_id,
+                total_streamed,
+                last_streamed_ledger,
+                paused,
+                cancelled,
+                completed,
+            } => {
+                let stream = self.treasury_streams.get_stream(stream_id);
+                if stream.total_streamed != *total_streamed
+                    || stream.last_streamed_ledger != *last_streamed_ledger
+                    || stream.paused != *paused
+                    || stream.cancelled != *cancelled
+                    || stream.completed != *completed
+                {
+                    panic!(
+                        "stream #{} does not match: expected total_streamed={} last_streamed_ledger={} paused={} cancelled={} completed={}; actual {:?}",
+                        stream_id,
+                        total_streamed,
+                        last_streamed_ledger,
+                        paused,
+                        cancelled,
+                        completed,
+                        stream
+                    );
+                }
+            }
+            SimStep::ExpectActiveStreams { count } => {
+                let active = self.treasury_streams.get_active_streams(&0u32, &u32::MAX);
+                if active.len() != *count {
+                    panic!(
+                        "expected {} active streams, found {}",
+                        count,
+                        active.len()
+                    );
+                }
+            }
+            SimStep::FundStreams { amount } => {
+                token::StellarAssetClient::new(&self.env, &self.token)
+                    .mint(&self.treasury_streams.address, amount);
+            }
+            SimStep::ExpectTokenBalance { actor, balance } => {
+                let holder = self.get_actor(actor).clone();
+                let actual = token::TokenClient::new(&self.env, &self.token).balance(&holder);
+                if actual != *balance {
+                    panic!(
+                        "expected {} to hold {} of the token, held {}",
+                        actor, balance, actual
+                    );
+                }
+            }
         }
     }
 
@@ -1303,6 +1549,28 @@ impl SimulationRunner {
     pub fn get_report(&self) -> &SimulationReport {
         &self.report
     }
+}
+
+/// The commit-reveal commitment, built exactly as `commit_reveal::compute_commitment`
+/// in `contracts/governor` builds it: `sha256(proposal_id_le || support_u8 || weight_seed_le || salt)`.
+fn commit_hash(
+    env: &Env,
+    proposal_id: u64,
+    support: &VoteSupport,
+    weight_seed: u128,
+    salt: &BytesN<32>,
+) -> BytesN<32> {
+    let support_byte: u8 = match support {
+        VoteSupport::Against => 0,
+        VoteSupport::For => 1,
+        VoteSupport::Abstain => 2,
+    };
+    let mut preimage = Bytes::new(env);
+    preimage.append(&Bytes::from_array(env, &proposal_id.to_le_bytes()));
+    preimage.append(&Bytes::from_array(env, &[support_byte]));
+    preimage.append(&Bytes::from_array(env, &weight_seed.to_le_bytes()));
+    preimage.append(&Bytes::from(salt.clone()));
+    env.crypto().sha256(&preimage).into()
 }
 
 fn panic_message(e: std::boxed::Box<dyn std::any::Any + Send>) -> String {

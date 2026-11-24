@@ -111,6 +111,18 @@ nebgov proposals create \
 `create` hashes the description file, submits a single-call proposal, and prints `{ "proposalId": ... }`. It supports
 `--dry-run`.
 
+Amendments are read and written through the backend, so `backendUrl` (`NEBGOV_BACKEND_URL`) is required:
+
+```bash
+nebgov proposals amendments 42                 # every version; version 0 is the original
+nebgov proposals amendment 42 2                # version 2 plus its diff against version 1
+nebgov proposals amend 42 --file ./revised.md --keypair ~/.nebgov/keys/proposer.secret
+```
+
+`amendment` prints `{ "amendment", "diffFromVersion", "diff" }`; `diff` is a JSON Merge Patch and is `null` for version
+0. `amend` submits a draft signed by the original proposer and supports `--dry-run`. Drafts are not canonical until the
+backend publishes them.
+
 ### vote
 
 ```bash

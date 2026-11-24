@@ -1,4 +1,5 @@
 import { registerGuardianCouncil } from "./guardianCouncil.js";
+import { registerProposalAmendments } from "./proposalAmendments.js";
 import { Command } from "commander";
 import {
   GovernorClient,
@@ -199,7 +200,7 @@ export function createProgram(): Command {
     return { global, cfg };
   };
 
-  program
+  const proposals = program
     .command("proposals")
     .description("Proposal commands")
     .addCommand(
@@ -289,6 +290,7 @@ export function createProgram(): Command {
           output({ proposalId }, global);
         }),
     );
+  registerProposalAmendments(proposals, context);
 
   program
     .command("vote")

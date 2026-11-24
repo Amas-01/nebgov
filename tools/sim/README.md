@@ -349,6 +349,71 @@ and fail with `WithdrawalNotYetClaimable` before the cooldown elapses. The mock
 adapter's interest rounds to zero over the few ledgers a scenario runs, so the
 balances above are exact. See `scenarios/treasury_strategies.json`.
 
+**Commit-Reveal Voting**
+
+Set `use_commit_reveal` (and optionally `commit_phase_fraction`, basis points of
+the voting period given to the commit phase, default 5000) in
+`governor_settings`. Like the other genesis settings, these apply once at
+deployment. Proposals created afterwards snapshot the split.
+
+```json
+{ "type": "CommitVote", "actor": "bob", "proposal_id": 1, "support": "For", "weight_seed": 11, "salt": 1 }
+{ "type": "RevealVote", "actor": "bob", "proposal_id": 1, "support": "For", "weight_seed": 11, "salt": 1 }
+{ "type": "ExpectTally", "proposal_id": 1, "votes_for": 500, "votes_against": 300, "votes_abstain": 0 }
+```
+
+The runner builds the commitment as the governor does,
+`sha256(proposal_id || support || weight_seed || salt)`, where `salt` fills all
+32 bytes with the given byte. Commit and reveal failures are checked with
+`ExpectError` (`#45` commit phase ended, `#46` reveal phase not started,
+`#48` commitment mismatch). `ExpectTally` asserts the applied tally, which
+includes only revealed votes. See `scenarios/commit_reveal.json`.
+
+**Guardian Council**
+
+`DeployGuardianCouncil` deploys `contracts/guardian-council` (deployer: the
+harness admin) and makes it the governor's guardian. Council action ids start at
+0. Council actions take effect through the same governor entrypoints as a
+single guardian.
+
+```json
+{ "type": "DeployGuardianCouncil", "members": ["m1", "m2", "m3"], "threshold": 2, "action_ttl_ledgers": 20 }
+{ "type": "CouncilPropose", "actor": "m3", "action": { "kind": "CancelActive", "proposal_id": 1 } }
+{ "type": "CouncilPropose", "actor": "m1", "action": { "kind": "RotateMember", "old_member": "m2", "new_member": "m4" } }
+{ "type": "CouncilApprove", "actor": "m2", "action_id": 0 }
+{ "type": "CouncilExecute", "action_id": 0 }
+{ "type": "ExpectCouncilAction", "action_id": 0, "approvals": 2, "executed": true }
+```
+
+`ExpectCouncilAction.approvals` counts the stored approval list, which keeps
+members who were later rotated out. Execution counts only live members, so
+execution can fail with `#6` (threshold not met) even when the stored count is
+high enough. Expired actions fail with `#7`. See `scenarios/guardian_council.json`.
+
+**Treasury Streams**
+
+`FundStreams` mints the governance token into `contracts/treasury-streams`,
+which pays every stream from its own balance. The treasury is the stream admin
+(it pauses, resumes and cancels). Streams are created as the governor.
+
+```json
+{ "type": "FundStreams", "amount": 100000 }
+{ "type": "CreateStream", "recipient": "bob", "amount_per_interval": 100, "interval_ledgers": 10, "start_ledger": 1, "end_ledger": 101 }
+{ "type": "CreateStream", "count": 30, "recipient": "carol", "amount_per_interval": 10, "interval_ledgers": 10, "start_ledger": 51, "end_ledger": 1000 }
+{ "type": "ExecuteStream", "stream_id": 1 }
+{ "type": "PauseStream", "stream_id": 1 }
+{ "type": "ResumeStream", "stream_id": 1 }
+{ "type": "CancelStream", "stream_id": 1 }
+{ "type": "ExpectStream", "stream_id": 1, "total_streamed": 400, "last_streamed_ledger": 41, "paused": false, "cancelled": false, "completed": false }
+{ "type": "ExpectActiveStreams", "count": 30 }
+{ "type": "ExpectTokenBalance", "actor": "bob", "balance": 400 }
+```
+
+`count` (default 1) creates that many identical streams, with ids assigned
+sequentially from 1. `ExecuteStream` is permissionless. `ExpectActiveStreams`
+reads the whole active list, so the step's recorded CPU cost grows with the
+list. See `scenarios/treasury_streams.json`.
+
 ## Simulation Report
 
 Each run produces a JSON report with per-step results and aggregate metrics:

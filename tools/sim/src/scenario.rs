@@ -37,6 +37,14 @@ pub struct SimGovernorSettings {
     pub max_proposals_per_period: u32,
     #[serde(default = "default_proposal_period_duration")]
     pub proposal_period_duration: u32,
+    /// Enables two-phase commit-reveal voting. Applied at genesis only, so
+    /// every proposal in the scenario snapshots it at creation.
+    #[serde(default)]
+    pub use_commit_reveal: bool,
+    /// Share of each proposal's voting period (in basis points) given to the
+    /// commit phase. Only read when `use_commit_reveal` is set.
+    #[serde(default = "default_commit_phase_fraction")]
+    pub commit_phase_fraction: u32,
 }
 
 fn default_max_calldata_size() -> u32 {
@@ -47,6 +55,12 @@ fn default_max_proposals_per_period() -> u32 {
 }
 fn default_proposal_period_duration() -> u32 {
     10_000
+}
+fn default_commit_phase_fraction() -> u32 {
+    5_000
+}
+fn default_stream_count() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -431,6 +445,129 @@ pub enum SimStep {
         #[serde(with = "i128_compat")]
         total: i128,
     },
+    /// Commit phase of commit-reveal voting: the runner hashes
+    /// `(proposal_id, support, weight_seed, salt)` exactly as the governor
+    /// does and submits the commitment. `salt` fills all 32 salt bytes.
+    CommitVote {
+        actor: String,
+        proposal_id: u64,
+        support: SimVoteSupport,
+        weight_seed: u64,
+        salt: u8,
+    },
+    /// Reveal phase: discloses the preimage used by the matching `CommitVote`.
+    RevealVote {
+        actor: String,
+        proposal_id: u64,
+        support: SimVoteSupport,
+        weight_seed: u64,
+        salt: u8,
+    },
+    /// Asserts a proposal's applied tally (only revealed votes count).
+    ExpectTally {
+        proposal_id: u64,
+        #[serde(with = "i128_compat")]
+        votes_for: i128,
+        #[serde(with = "i128_compat")]
+        votes_against: i128,
+        #[serde(with = "i128_compat")]
+        votes_abstain: i128,
+    },
+    /// Deploys `contracts/guardian-council` with the harness admin as deployer,
+    /// then makes it the governor's guardian. Only one council per scenario.
+    DeployGuardianCouncil {
+        members: Vec<String>,
+        threshold: u32,
+        action_ttl_ledgers: u32,
+    },
+    /// A member proposes a council action; the proposer's approval is recorded
+    /// automatically. Action ids are assigned sequentially from 0.
+    CouncilPropose {
+        actor: String,
+        action: SimCouncilAction,
+    },
+    CouncilApprove {
+        actor: String,
+        action_id: u64,
+    },
+    /// Permissionless once the action has met the approval threshold.
+    CouncilExecute {
+        action_id: u64,
+    },
+    /// `approvals` is the stored approval list, including members who have
+    /// since been rotated out, which is why it can exceed the live count.
+    ExpectCouncilAction {
+        action_id: u64,
+        approvals: u32,
+        executed: bool,
+    },
+    /// Deploys `contracts/treasury-streams`: the treasury is its admin (may
+    /// pause, resume and cancel) and the governor is the only creator.
+    /// Streams are created as the governor.
+    CreateStream {
+        /// Number of identical streams to create. Ids are sequential from 1.
+        #[serde(default = "default_stream_count")]
+        count: u32,
+        recipient: String,
+        #[serde(with = "i128_compat")]
+        amount_per_interval: i128,
+        interval_ledgers: u32,
+        start_ledger: u32,
+        end_ledger: u32,
+    },
+    /// Permissionless: pays every whole interval that has come due.
+    ExecuteStream {
+        stream_id: u64,
+    },
+    /// Pause, resume and cancel are called as the treasury (the stream admin).
+    PauseStream {
+        stream_id: u64,
+    },
+    ResumeStream {
+        stream_id: u64,
+    },
+    CancelStream {
+        stream_id: u64,
+    },
+    ExpectStream {
+        stream_id: u64,
+        #[serde(with = "i128_compat")]
+        total_streamed: i128,
+        last_streamed_ledger: u32,
+        paused: bool,
+        cancelled: bool,
+        completed: bool,
+    },
+    /// Reads the full active-stream list, so the step's recorded CPU cost
+    /// scales with the list length.
+    ExpectActiveStreams {
+        count: u32,
+    },
+    /// Mints the governance token into the treasury-streams contract, which
+    /// pays every stream out of its own balance.
+    FundStreams {
+        #[serde(with = "i128_compat")]
+        amount: i128,
+    },
+    ExpectTokenBalance {
+        actor: String,
+        #[serde(with = "i128_compat")]
+        balance: i128,
+    },
+}
+
+/// A guardian-council action a scenario can propose. Mirrors the subset of
+/// `GuardianAction` the simulator exercises.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum SimCouncilAction {
+    CancelActive {
+        proposal_id: u64,
+    },
+    RotateMember {
+        old_member: String,
+        new_member: String,
+    },
 }
 
 impl SimStep {
@@ -507,6 +644,23 @@ impl SimStep {
             SimStep::ExpectTreasuryAllocation { .. } => "ExpectTreasuryAllocation",
             SimStep::ExpectTreasuryBalance { .. } => "ExpectTreasuryBalance",
             SimStep::ExpectTreasuryTotalValue { .. } => "ExpectTreasuryTotalValue",
+            SimStep::CommitVote { .. } => "CommitVote",
+            SimStep::RevealVote { .. } => "RevealVote",
+            SimStep::ExpectTally { .. } => "ExpectTally",
+            SimStep::DeployGuardianCouncil { .. } => "DeployGuardianCouncil",
+            SimStep::CouncilPropose { .. } => "CouncilPropose",
+            SimStep::CouncilApprove { .. } => "CouncilApprove",
+            SimStep::CouncilExecute { .. } => "CouncilExecute",
+            SimStep::ExpectCouncilAction { .. } => "ExpectCouncilAction",
+            SimStep::CreateStream { .. } => "CreateStream",
+            SimStep::ExecuteStream { .. } => "ExecuteStream",
+            SimStep::PauseStream { .. } => "PauseStream",
+            SimStep::ResumeStream { .. } => "ResumeStream",
+            SimStep::CancelStream { .. } => "CancelStream",
+            SimStep::ExpectStream { .. } => "ExpectStream",
+            SimStep::ExpectActiveStreams { .. } => "ExpectActiveStreams",
+            SimStep::FundStreams { .. } => "FundStreams",
+            SimStep::ExpectTokenBalance { .. } => "ExpectTokenBalance",
         }
     }
 }
@@ -666,7 +820,12 @@ impl Scenario {
                 | SimStep::FundRewardsPool { actor, .. }
                 | SimStep::ClaimReward { actor, .. }
                 | SimStep::ExpectRewardClaimed { actor, .. }
-                | SimStep::ExpectRewardBalance { actor, .. } => Some(actor.as_str()),
+                | SimStep::ExpectRewardBalance { actor, .. }
+                | SimStep::CommitVote { actor, .. }
+                | SimStep::RevealVote { actor, .. }
+                | SimStep::CouncilPropose { actor, .. }
+                | SimStep::CouncilApprove { actor, .. }
+                | SimStep::ExpectTokenBalance { actor, .. } => Some(actor.as_str()),
                 _ => None,
             };
             if let Some(name) = actor_ref {
@@ -700,6 +859,30 @@ impl Scenario {
                     ));
                 }
             }
+            let mut referenced_actors: Vec<&str> = Vec::new();
+            match step {
+                SimStep::CreateStream { recipient, .. } => referenced_actors.push(recipient),
+                SimStep::DeployGuardianCouncil { members, .. } => {
+                    referenced_actors.extend(members.iter().map(String::as_str));
+                }
+                SimStep::CouncilPropose {
+                    action:
+                        SimCouncilAction::RotateMember {
+                            old_member,
+                            new_member,
+                        },
+                    ..
+                } => {
+                    referenced_actors.push(old_member);
+                    referenced_actors.push(new_member);
+                }
+                _ => {}
+            }
+            for name in referenced_actors {
+                if !actor_names.contains(name) {
+                    return Err(format!("step {} references unknown actor '{}'", i, name));
+                }
+            }
             match step {
                 SimStep::Propose { .. }
                 | SimStep::FinalizeDraft { .. }
@@ -716,7 +899,10 @@ impl Scenario {
                 | SimStep::ExpectState { proposal_id, .. }
                 | SimStep::AssertParticipation { proposal_id, .. }
                 | SimStep::AssertQuorumReached { proposal_id }
-                | SimStep::RefundProposalBond { proposal_id, .. } => {
+                | SimStep::RefundProposalBond { proposal_id, .. }
+                | SimStep::CommitVote { proposal_id, .. }
+                | SimStep::RevealVote { proposal_id, .. }
+                | SimStep::ExpectTally { proposal_id, .. } => {
                     if !known_proposals.contains(proposal_id) {
                         return Err(format!(
                             "step {} references proposal #{} before it is created",
