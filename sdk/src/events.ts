@@ -1891,6 +1891,37 @@ export function subscribeToPoolFunded(address: string, callback: (event: Soroban
   return createTopicSubscription(address, VOTING_REWARDS_TOPICS.poolFunded, callback, opts);
 }
 
+ feat/issues-1575-1577-1578-1583
+export interface EpochSweptEventData { epochId: bigint; remaining: bigint }
+export interface AdminSetEventData { admin: string }
+export interface EpochDurationUpdatedEventData { oldDuration: number; newDuration: number }
+export interface EscrowConfigUpdatedEventData { oldConfig: unknown; newConfig: unknown }
+export function parseEpochSweptEvent(event: SorobanEvent): EpochSweptEventData | null { if (event.topic[0] !== "EpochSwept" || !Array.isArray(event.value) || event.value.length < 2) return null; const epochId = toBigInt(event.value[0]); const remaining = toBigInt(event.value[1]); return epochId === null || remaining === null ? null : { epochId, remaining }; }
+export function parseAdminSetEvent(event: SorobanEvent): AdminSetEventData | null { if (event.topic[0] !== "AdminSet") return null; return { admin: String(Array.isArray(event.value) ? event.value[0] : event.value ?? event.topic[1] ?? "") }; }
+export function parseEpochDurationUpdatedEvent(event: SorobanEvent): EpochDurationUpdatedEventData | null { if (event.topic[0] !== "EpochDurationUpdated" || !Array.isArray(event.value) || event.value.length < 2) return null; const oldDuration = toNumber(event.value[0]); const newDuration = toNumber(event.value[1]); return oldDuration === null || newDuration === null ? null : { oldDuration, newDuration }; }
+export function parseEscrowConfigUpdatedEvent(event: SorobanEvent): EscrowConfigUpdatedEventData | null { if (event.topic[0] !== "EscrowConfigUpdated" || !Array.isArray(event.value) || event.value.length < 2) return null; return { oldConfig: event.value[0], newConfig: event.value[1] }; }
+export function subscribeToEpochSwept(address: string, callback: (event: SorobanEvent) => void, opts: SubscriptionOptions): () => void { return createTopicSubscription(address, "EpochSwept", callback, opts); }
+export function subscribeToAdminSet(address: string, callback: (event: SorobanEvent) => void, opts: SubscriptionOptions): () => void { return createTopicSubscription(address, "AdminSet", callback, opts); }
+export function subscribeToEpochDurationUpdated(address: string, callback: (event: SorobanEvent) => void, opts: SubscriptionOptions): () => void { return createTopicSubscription(address, "EpochDurationUpdated", callback, opts); }
+export function subscribeToEscrowConfigUpdated(address: string, callback: (event: SorobanEvent) => void, opts: SubscriptionOptions): () => void { return createTopicSubscription(address, "EscrowConfigUpdated", callback, opts); }
+
+export interface LiquidityAddedEventData { provider: string; outcomeA: number; outcomeB: number; amountA: bigint; amountB: bigint; lpTokensMinted: bigint }
+export interface LiquidityRemovedEventData { provider: string; outcomeA: number; outcomeB: number; amountA: bigint; amountB: bigint; lpTokensBurned: bigint }
+export interface SwapEventData { trader: string; outcomeIn: number; outcomeOut: number; amountIn: bigint; amountOut: bigint; fee: bigint }
+export interface PoolFeeUpdatedEventData { outcomeA: number; outcomeB: number; oldFeeBps: number; newFeeBps: number }
+function parseLiquidityRecord(event: SorobanEvent, topic: string): EventRecord | null { return event.topic[0] === topic && isRecord(event.value) ? event.value : null; }
+export function parseLiquidityAddedEvent(event: SorobanEvent): LiquidityAddedEventData | null { const r = parseLiquidityRecord(event, "LiquidityAdded"); if (!r) return null; const outcomeA=toNumber(r.outcome_a), outcomeB=toNumber(r.outcome_b), amountA=toBigInt(r.amount_a), amountB=toBigInt(r.amount_b), lpTokensMinted=toBigInt(r.lp_tokens_minted); return outcomeA===null||outcomeB===null||amountA===null||amountB===null||lpTokensMinted===null?null:{provider:String(r.provider??event.topic[1]??""),outcomeA,outcomeB,amountA,amountB,lpTokensMinted}; }
+export function parseLiquidityRemovedEvent(event: SorobanEvent): LiquidityRemovedEventData | null { const r = parseLiquidityRecord(event, "LiquidityRemoved"); if (!r) return null; const outcomeA=toNumber(r.outcome_a), outcomeB=toNumber(r.outcome_b), amountA=toBigInt(r.amount_a), amountB=toBigInt(r.amount_b), lpTokensBurned=toBigInt(r.lp_tokens_burned); return outcomeA===null||outcomeB===null||amountA===null||amountB===null||lpTokensBurned===null?null:{provider:String(r.provider??event.topic[1]??""),outcomeA,outcomeB,amountA,amountB,lpTokensBurned}; }
+export function parseSwapEvent(event: SorobanEvent): SwapEventData | null { const r=parseLiquidityRecord(event,"Swap"); if(!r)return null; const outcomeIn=toNumber(r.outcome_in),outcomeOut=toNumber(r.outcome_out),amountIn=toBigInt(r.amount_in),amountOut=toBigInt(r.amount_out),fee=toBigInt(r.fee); return outcomeIn===null||outcomeOut===null||amountIn===null||amountOut===null||fee===null?null:{trader:String(r.trader??event.topic[1]??""),outcomeIn,outcomeOut,amountIn,amountOut,fee}; }
+export function parsePoolFeeUpdatedEvent(event: SorobanEvent): PoolFeeUpdatedEventData | null { const r=parseLiquidityRecord(event,"PoolFeeUpdated"); if(!r)return null; const outcomeA=toNumber(r.outcome_a),outcomeB=toNumber(r.outcome_b),oldFeeBps=toNumber(r.old_fee_bps),newFeeBps=toNumber(r.new_fee_bps); return outcomeA===null||outcomeB===null||oldFeeBps===null||newFeeBps===null?null:{outcomeA,outcomeB,oldFeeBps,newFeeBps}; }
+export const subscribeToLiquidityAdded = (a:string,c:(e:SorobanEvent)=>void,o:SubscriptionOptions) => createTopicSubscription(a,"LiquidityAdded",c,o);
+export const subscribeToLiquidityRemoved = (a:string,c:(e:SorobanEvent)=>void,o:SubscriptionOptions) => createTopicSubscription(a,"LiquidityRemoved",c,o);
+export const subscribeToSwap = (a:string,c:(e:SorobanEvent)=>void,o:SubscriptionOptions) => createTopicSubscription(a,"Swap",c,o);
+export const subscribeToPoolFeeUpdated = (a:string,c:(e:SorobanEvent)=>void,o:SubscriptionOptions) => createTopicSubscription(a,"PoolFeeUpdated",c,o);
+
+
+
+ main
 // ── Standalone governance and treasury contract events ───────────────────────
 // Event names are namespaced to avoid collisions with core governor/budget streams.
 // Soroban contracttype structs decode to snake_case objects; tuple values to arrays.
