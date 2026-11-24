@@ -18,6 +18,7 @@ NebGov is the canonical governance framework for the Stellar ecosystem — a mod
 | Proposal lifecycle     | Create, vote, queue, and execute on-chain proposals |
 | Timelock execution     | Mandatory delay between passing and execution ([docs](./docs/timelock.md)) |
 | Token-weighted voting  | Snapshot voting power from any SEP-41 token         |
+| Commit-reveal voting   | Optional two-phase voting that hides vote choices until the reveal window ([docs](./docs/commit-reveal.md)) |
 | Delegation             | Delegate voting power to any address, in full or split by percentage ([docs](./docs/split-delegation.md)) |
 | Time-locked voting boost | Lock tokens to gain amplified, linearly-decaying voting power ([docs](./docs/vote-escrow.md)) |
 | Multi-sig treasury     | DAO-controlled treasury with configurable threshold |
@@ -110,7 +111,10 @@ See [docs/architecture.md](./docs/architecture.md) for the full design overview.
 ## Production Deployment Guides
 
 - [docs/deployment.md](./docs/deployment.md) — full production deployment walkthrough for contracts, backend, indexer, and frontend
-- [docs/parameter-guide.md](./docs/parameter-guide.md) — safe governance parameter ranges and preset configurations
+- [docs/parameter-guide.md](./docs/parameter-guide.md) — safe governance parameter ranges and preset configurations, including time-weighted voting and checkpoint pruning
+- [docs/commit-reveal.md](./docs/commit-reveal.md) — two-phase voting, preimage format, timing, and SDK usage
+- [docs/proposal-amendments.md](./docs/proposal-amendments.md) — Pending-proposal versioning, diffs, API, and SDK usage
+- [docs/notifications.md](./docs/notifications.md) — rule matching, delivery channels, webhook signatures, and retries
 - [docs/security.md](./docs/security.md) — treasury reentrancy analysis and contract security notes
 - [docs/deployments.md](./docs/deployments.md) — official contract addresses for all networks
 - [docs/troubleshooting.md](./docs/troubleshooting.md) — RPC, wallet, transaction, and contract error reference

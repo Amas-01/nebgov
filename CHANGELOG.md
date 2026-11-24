@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Documentation: commit-reveal voting, time-weighted voting and checkpoint pruning, proposal amendments, and the notification engine, with updated README, architecture, and parameter-guide links (#1627, #1628, #1629, #1630).
 - Treasury Streams: `contracts/treasury-streams` for recurring treasury payments, created by the governor and paid out permissionlessly per whole interval, with pause, resume and cancel. Includes the SDK `TreasuryStreamsClient`, a backend executor job gated on `TREASURY_STREAMS_CONTRACT_ID`, and the `treasury_stream_failures` table (migration 014).
 - Simulation: `treasury_strategies` scenario covering deposit, withdrawal cooldown, early and double claims, and over-allocation (new `tools/sim` steps for treasury strategies).
 - Architecture docs: sections for the proposal-bonds, optimistic-governor, conviction-voting, treasury-strategies and signal-anchor contracts, and their events.

@@ -88,6 +88,11 @@ The core governance contract that manages:
 - `GovernorUpgraded`: Contract upgraded
 - `ReputationUpdated`: A proposer's reputation score changed
 - `EffectiveThresholdChanged`: A proposer's reputation-adjusted proposal threshold changed
+- `CommitPhaseStarted` / `VoteCommitted` / `VoteRevealed`: Two-phase commit-reveal voting
+
+#### Commit-reveal voting
+
+When `use_commit_reveal` is enabled, proposals created afterward run in two windows: a commit phase that records only a salted hash, followed by a reveal phase that verifies the preimage and applies the vote. Direct `cast_vote` is disabled for those proposals. See [commit-reveal.md](./commit-reveal.md) for the threat model, timing formula, exact preimage encoding, unrevealed-commit behavior, and SDK walkthrough.
 
 #### Proposer reputation
 
@@ -368,6 +373,7 @@ other (a `Single` strategy pointing at one of them). Voting weight is always rea
 which is why vote-escrow keeps lock history and global checkpoints. Changing the strategy is done with
 `set_voting_strategy`, which requires the governor's own authorization, so it goes through a governance proposal.
 Under `MultiToken`, a source that errors is counted as zero rather than failing the vote.
+`token-votes` can add a time-based voting-power bonus and prune old checkpoints; see [parameter-guide.md](./parameter-guide.md#token-votes-time-weighting) for the formula, defaults, and snapshot-safety guidance.
 
 ### Indexer Service
 
@@ -423,6 +429,8 @@ The backend API serves as the primary interface for the frontend application:
 - Implements business logic
 - Handles authentication and authorization
 - Provides optimized queries for frontend use
+
+The API also hosts [proposal amendments](./proposal-amendments.md) for Pending-proposal versioning and diffs, and the [notification engine](./notifications.md), which evaluates indexed events against user rules and delivers in-app, email, webhook, and Telegram alerts.
 
 ### Frontend Web App
 
