@@ -53,6 +53,18 @@ export function parseId(value: string, field: string): number {
   return Number(parseUnsigned(value, field, BigInt(Number.MAX_SAFE_INTEGER)));
 }
 
+/**
+ * A timelock operation or batch id: the 32-byte SHA-256 the contract derives,
+ * written as 64 hex characters. Returned lowercased, as the SDK expects.
+ */
+export function parseOperationId(value: string, field: string): string {
+  const hex = value.trim().replace(/^0x/i, "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hex)) {
+    throw new Error(`${field} must be a 32-byte hex operation id (64 hex characters), got "${value}"`);
+  }
+  return hex;
+}
+
 export function parsePositiveInt(value: string, field: string): number {
   const parsed = parseId(value, field);
   if (parsed < 1) throw new Error(`${field} must be at least 1, got ${value}`);

@@ -75,6 +75,7 @@ Example `~/.nebgov/config.json`:
 | `NEBGOV_CONVICTION_VOTING_ADDRESS` | n/a (env only) | `conviction-voting` |
 | `NEBGOV_OPTIMISTIC_GOVERNOR_ADDRESS` | n/a (env only) | `optimistic-governor` |
 | `NEBGOV_TREASURY_STRATEGIES_ADDRESS` | n/a (env only) | `treasury-strategies` |
+| `NEBGOV_TREASURY_STREAMS_ADDRESS` | `treasuryStreamsAddress` | `recurring-streams` (required). |
 | `NEBGOV_WRAPPER_ADDRESS` | `wrapperAddress` | `wrapper` (required). |
 | `NEBGOV_LIQUIDITY_ADDRESS` | `liquidityAddress` | `liquidity` (required). |
 | `NEBGOV_SIGNAL_ANCHOR_ADDRESS` | n/a (env only) | `signaling-polls` |
@@ -129,6 +130,18 @@ backend publishes them.
 nebgov vote cast 42 for --keypair ~/.nebgov/keys/voter.secret   # for | against | abstain
 nebgov vote status 42 --voter G...
 ```
+
+Commit-reveal proposals take a two-step vote. The commit hides your choice; the reveal discloses it.
+
+```bash
+nebgov vote commit 42 --support for --keypair ~/.nebgov/keys/voter.secret   # during the commit phase
+nebgov vote reveal 42 --keypair ~/.nebgov/keys/voter.secret                 # during the reveal phase
+nebgov vote cr-status 42 --voter G...                                       # phase, deadlines, hasCommitted
+```
+
+`vote commit` saves the salt, weight seed and support to `~/.nebgov/commit-reveal/` (mode `0600`), or to `--file`.
+`reveal` reads that file back, so keep it. **If it is lost, the vote can never be revealed and will not count.**
+`vote commit` never overwrites an existing record: reveal the earlier vote first, or pass a different `--file`.
 
 ### delegate
 
@@ -261,6 +274,42 @@ nebgov voting-rewards fund --amount 5000000000 --keypair ~/.nebgov/keys/funder.s
 ```
 
 `--proof` accepts a JSON array of hex strings or a comma-separated list. `claim` supports `--dry-run`.
+
+### timelock
+
+Set `NEBGOV_TIMELOCK_ADDRESS` or `timelockAddress` in the config. Operation and batch ids are the 64-character hex
+ids the timelock derives (`0x` prefix is accepted).
+
+```bash
+nebgov timelock get-op <id>                  # stored operation, or null
+nebgov timelock ready <id>                   # has the delay elapsed?
+nebgov timelock execute <id> --keypair governor.secret
+nebgov timelock cancel <id> --keypair admin.secret
+nebgov timelock min-delay                    # minimum delay in seconds for new operations
+nebgov timelock batch <id>                   # stored batch operation, or null
+nebgov timelock batch-dag <id>               # predecessor dependency graph of a batch
+```
+
+`execute` and `cancel` support `--dry-run`. The SDK does not return a transaction hash for these two, so their output
+reports the signer and operation id instead.
+
+### recurring-streams
+
+Set `NEBGOV_TREASURY_STREAMS_ADDRESS` or `treasuryStreamsAddress` in the config. This is the standalone
+treasury-streams contract, separate from the streams inside `treasury`.
+
+```bash
+nebgov recurring-streams list --limit 20
+nebgov recurring-streams get 3
+nebgov recurring-streams claimable 3         # amount executing the stream would pay now
+nebgov recurring-streams by-recipient G... --limit 20
+nebgov recurring-streams execute 3 --keypair executor.secret     # permissionless
+nebgov recurring-streams pause 3 --keypair creator.secret
+nebgov recurring-streams resume 3 --keypair creator.secret
+nebgov recurring-streams cancel 3 --keypair creator.secret       # execute any due intervals first; they are forfeited
+```
+
+`list` and `by-recipient` take `--offset` and `--limit`. The mutating commands support `--dry-run`.
 
 ## Tests
 

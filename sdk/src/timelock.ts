@@ -54,6 +54,62 @@ function mapFailedOp(raw: any): FailedOperation {
   };
 }
 
+/** A single stored timelock operation, as returned by `get_operation`. */
+export interface TimelockOperation {
+  target: string;
+  /** Hex-encoded calldata. */
+  data: string;
+  fnName: string;
+  /** Ledger timestamp at which the operation becomes executable. */
+  readyAt: number;
+  /** Ledger timestamp after which the operation can no longer execute. */
+  expiresAt: number;
+  executed: boolean;
+  cancelled: boolean;
+  /** Hex-encoded predecessor op id, or empty when there is none. */
+  predecessor: string;
+}
+
+/** A stored batch operation, as returned by `get_batch_operation`. */
+export interface TimelockBatchOperation {
+  targets: string[];
+  /** Hex-encoded calldata, one entry per target. */
+  datas: string[];
+  fnNames: string[];
+  readyAt: number;
+  expiresAt: number;
+  executed: boolean;
+  cancelled: boolean;
+  /** Hex-encoded predecessor op id, or empty when there is none. */
+  predecessor: string;
+}
+
+function mapOperation(raw: any): TimelockOperation {
+  return {
+    target: String(raw.target),
+    data: Buffer.from(raw.data).toString("hex"),
+    fnName: String(raw.fn_name),
+    readyAt: Number(raw.ready_at),
+    expiresAt: Number(raw.expires_at),
+    executed: Boolean(raw.executed),
+    cancelled: Boolean(raw.cancelled),
+    predecessor: Buffer.from(raw.predecessor).toString("hex"),
+  };
+}
+
+function mapBatchOperation(raw: any): TimelockBatchOperation {
+  return {
+    targets: (raw.targets ?? []).map((address: unknown) => String(address)),
+    datas: (raw.datas ?? []).map((data: Uint8Array) => Buffer.from(data).toString("hex")),
+    fnNames: (raw.fn_names ?? []).map((name: unknown) => String(name)),
+    readyAt: Number(raw.ready_at),
+    expiresAt: Number(raw.expires_at),
+    executed: Boolean(raw.executed),
+    cancelled: Boolean(raw.cancelled),
+    predecessor: Buffer.from(raw.predecessor).toString("hex"),
+  };
+}
+
 function mapDependencyGraph(raw: any): DependencyGraph {
   return {
     nodes: (raw.nodes ?? []).map((b: Uint8Array) =>
@@ -618,6 +674,68 @@ export class TimelockClient {
       const raw = (result as SorobanRpc.Api.SimulateTransactionSuccessResponse)
         .result?.retval;
       return raw ? mapDependencyGraph(scValToNative(raw)) : null;
+    });
+  }
+
+  /**
+   * Read a stored single operation.
+   *
+   * @param opId - Hex-encoded operation ID
+   * @returns The operation, or null if it does not exist or the read fails
+   */
+  async getOperation(opId: string): Promise<TimelockOperation | null> {
+    return this.retry(async () => {
+      const result = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount(this.readAccount()),
+          { fee: BASE_FEE, networkPassphrase: this.networkPassphrase },
+        )
+          .addOperation(
+            this.contract.call(
+              "get_operation",
+              nativeToScVal(Buffer.from(opId, "hex"), { type: "bytes" }),
+            ),
+          )
+          .setTimeout(30)
+          .build(),
+      );
+
+      if (SorobanRpc.Api.isSimulationError(result)) return null;
+      const raw = (result as SorobanRpc.Api.SimulateTransactionSuccessResponse)
+        .result?.retval;
+      const native = raw ? scValToNative(raw) : null;
+      return native ? mapOperation(native) : null;
+    });
+  }
+
+  /**
+   * Read a stored batch operation.
+   *
+   * @param batchOpId - Hex-encoded batch operation ID
+   * @returns The batch operation, or null if it does not exist or the read fails
+   */
+  async getBatchOperation(batchOpId: string): Promise<TimelockBatchOperation | null> {
+    return this.retry(async () => {
+      const result = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount(this.readAccount()),
+          { fee: BASE_FEE, networkPassphrase: this.networkPassphrase },
+        )
+          .addOperation(
+            this.contract.call(
+              "get_batch_operation",
+              nativeToScVal(Buffer.from(batchOpId, "hex"), { type: "bytes" }),
+            ),
+          )
+          .setTimeout(30)
+          .build(),
+      );
+
+      if (SorobanRpc.Api.isSimulationError(result)) return null;
+      const raw = (result as SorobanRpc.Api.SimulateTransactionSuccessResponse)
+        .result?.retval;
+      const native = raw ? scValToNative(raw) : null;
+      return native ? mapBatchOperation(native) : null;
     });
   }
 

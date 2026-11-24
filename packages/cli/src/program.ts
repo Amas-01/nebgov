@@ -1,5 +1,7 @@
 import { registerGuardianCouncil } from "./guardianCouncil.js";
-import { registerProposalAmendments } from "./proposalAmendments.js";
+import { registerTimelock } from "./timelock.js";
+import { registerRecurringStreams } from "./recurringStreams.js";
+import { registerVoteCommitReveal } from "./commitReveal.js";
 import { Command } from "commander";
 import {
   GovernorClient,
@@ -292,7 +294,7 @@ export function createProgram(): Command {
     );
   registerProposalAmendments(proposals, context);
 
-  program
+  const vote = program
     .command("vote")
     .description("Vote commands")
     .addCommand(
@@ -607,6 +609,9 @@ export function createProgram(): Command {
     );
 
   registerGuardianCouncil(program, context);
+  registerTimelock(program, context);
+  registerRecurringStreams(program, context);
+  registerVoteCommitReveal(vote, context);
 
   program
     .command("proposal-bonds")

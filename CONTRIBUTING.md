@@ -193,6 +193,42 @@ Captured command output (for example `cargo test > test_output.txt`) likewise st
 
 **No `unsafe` code**: The `#![no_std]` environment does not allow `unsafe`. Any dependency that requires it must be justified in the PR description.
 
+### Storage and TTL
+
+Soroban entries expire. Each one has a time-to-live (TTL) measured in ledgers. When it reaches zero the entry is archived, and the contract can no longer read it until someone restores it. A contract that does not extend the TTL of its own entries will eventually stop working. Stellar closes a ledger about every 5 seconds, so the durations below are approximate.
+
+**Storage types**
+
+- **Instance** storage holds contract-wide state such as config, admin and counters. One TTL covers all of it, and it lives as long as the contract instance does.
+- **Persistent** storage holds per-user and per-proposal records. Each key has its own TTL.
+
+**When to bump**
+
+1. **On every persistent write.** After `set`, extend the entry's TTL with the constant for its data kind: `storage().persistent().extend_ttl(&key, TTL, TTL)`.
+2. **On hot reads.** If callers keep querying a record over time, extend it on read as well, so a frequently read entry never ages out. `get_anchor` in `contracts/signal-anchor/src/lib.rs` is the reference.
+3. **Instance storage in every entrypoint that touches state.** Call an `extend_instance_ttl(&env)` helper at the start of the function, using `INSTANCE_TTL_THRESHOLD = 100_000` and `INSTANCE_EXTEND_TTL = 300_000` (see `contracts/timelock/src/lib.rs`).
+4. **Guard persistent bumps with `has(&key)`.** The `extend_persistent_ttl` helper in `contracts/token-votes/src/lib.rs` does this, so a bump on a missing key cannot abort the call.
+
+`extend_ttl(threshold, extend_to)` only extends when the current TTL is at or below `threshold`. Passing the same value for both, as the persistent bumps in this repo do, tops the entry up to the full duration on every touch.
+
+**Which constant to use**
+
+Pick the row whose lifetime matches how long the data must stay readable. Define a named constant in your contract's `lib.rs` rather than inlining a number.
+
+| Data kind | Ledgers | Approx. duration | Existing constant |
+| --- | --- | --- | --- |
+| Long-lived records and state (token-votes, wrapper, liquidity, streams, signal anchors) | 6,307,200 | ~365 days | `TTL_LEDGERS`, `PERSISTENT_TTL_LEDGERS`, `ANCHOR_TTL_LEDGERS` |
+| Multi-month governance records (reputation, commit-reveal, factory registry, voting rewards) | 3,110,400 | ~180 days | `REPUTATION_TTL_LEDGERS`, `COMMIT_REVEAL_TTL_LEDGERS`, `GOVERNOR_TTL_LEDGERS`, `REWARDS_TTL_LEDGERS` |
+| Guardian council actions | 1,200,000 | ~69 days | `COUNCIL_TTL_LEDGERS` |
+| Bonds, conviction votes and optimistic records | 1,000,000 | ~58 days | `BOND_TTL_LEDGERS`, `TTL_LEDGERS`, `RECORD_TTL_LEDGERS` |
+| Short-lived treasury transactions and treasury-module streams | 518,400 | ~30 days | `TX_STORAGE_TTL_LEDGERS`, `STREAM_TTL_LEDGERS` |
+
+Don't introduce a new duration without a reason, and explain it in the PR description if you do.
+
+**How to test**
+
+Advance the ledger sequence with `env.ledger().with_mut(|l| l.sequence_number += N)` and read the entry back. Advance past `INSTANCE_TTL_THRESHOLD` but stay inside the entry's TTL, otherwise the test only proves the entry was extended within the test. `test_persistent_delegation_entries_survive_default_ttl` in `contracts/token-votes/src/lib.rs` shows the pattern. For a contract with a read-path bump, also check that a read after a long gap keeps the record alive.
+
 ### Security Checklist for Contract PRs
 
 Before requesting review, verify:

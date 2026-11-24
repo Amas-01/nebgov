@@ -431,4 +431,100 @@ describe("TimelockClient", () => {
       expect(delay).toBe(0n);
     });
   });
+
+  describe("getOperation()", () => {
+    const mockOpId = "a1b2c3d4";
+
+    it("maps the stored operation to camelCase hex fields", async () => {
+      mockSimulate.mockResolvedValue({ result: { retval: {} as xdr.ScVal } });
+      mockScValToNative.mockReturnValue({
+        target: validCAddr,
+        data: Buffer.from([1, 2]),
+        fn_name: "execute",
+        ready_at: 100n,
+        expires_at: 200n,
+        executed: false,
+        cancelled: false,
+        predecessor: new Uint8Array(),
+      });
+
+      const op = await client.getOperation(mockOpId);
+
+      expect(op).toEqual({
+        target: validCAddr,
+        data: "0102",
+        fnName: "execute",
+        readyAt: 100,
+        expiresAt: 200,
+        executed: false,
+        cancelled: false,
+        predecessor: "",
+      });
+    });
+
+    it("returns null when the operation does not exist (None)", async () => {
+      mockSimulate.mockResolvedValue({ result: { retval: {} as xdr.ScVal } });
+      mockScValToNative.mockReturnValue(undefined);
+
+      expect(await client.getOperation(mockOpId)).toBeNull();
+    });
+
+    it("returns null when simulation fails", async () => {
+      mockIsSimulationError.mockReturnValue(true);
+      mockSimulate.mockResolvedValue({ error: "Contract error" });
+
+      expect(await client.getOperation(mockOpId)).toBeNull();
+    });
+
+    it("returns null when no return value", async () => {
+      mockSimulate.mockResolvedValue({ result: {} });
+
+      expect(await client.getOperation(mockOpId)).toBeNull();
+    });
+  });
+
+  describe("getBatchOperation()", () => {
+    const mockBatchId = "a1b2c3d4";
+
+    it("maps the stored batch to camelCase hex fields", async () => {
+      mockSimulate.mockResolvedValue({ result: { retval: {} as xdr.ScVal } });
+      mockScValToNative.mockReturnValue({
+        targets: [validCAddr],
+        datas: [Buffer.from([0xaa])],
+        fn_names: ["set"],
+        ready_at: 5n,
+        expires_at: 9n,
+        executed: true,
+        cancelled: false,
+        predecessor: Buffer.from([0xff]),
+      });
+
+      const batch = await client.getBatchOperation(mockBatchId);
+
+      expect(batch).toEqual({
+        targets: [validCAddr],
+        datas: ["aa"],
+        fnNames: ["set"],
+        readyAt: 5,
+        expiresAt: 9,
+        executed: true,
+        cancelled: false,
+        predecessor: "ff",
+      });
+    });
+
+    it("returns null when the batch does not exist", async () => {
+      mockSimulate.mockResolvedValue({ result: { retval: {} as xdr.ScVal } });
+      mockScValToNative.mockReturnValue(undefined);
+
+      expect(await client.getBatchOperation(mockBatchId)).toBeNull();
+    });
+
+    it("returns null when simulation fails", async () => {
+      mockIsSimulationError.mockReturnValue(true);
+      mockSimulate.mockResolvedValue({ error: "Contract error" });
+
+      expect(await client.getBatchOperation(mockBatchId)).toBeNull();
+    });
+  });
 });

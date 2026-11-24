@@ -24,6 +24,7 @@ export type { DelegationSigConfig, DelegationTxResult } from "./delegation-sig";
 export { FactoryClient } from "./factory";
 export type { GovernorEntry, DeploySettings } from "./factory";
 export { TimelockClient } from "./timelock";
+export type { TimelockOperation, TimelockBatchOperation } from "./timelock";
 export { TreasuryClient } from "./treasury";
 export { LiquidityClient } from "./liquidity";
 export { AnalyticsClient } from "./analytics";

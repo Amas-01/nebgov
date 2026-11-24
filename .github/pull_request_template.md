@@ -25,3 +25,4 @@
 - [ ] My changes generate no new warnings
 - [ ] I have added tests that prove my fix is effective or that my feature works
 - [ ] New and existing unit tests passed locally with my changes
+- [ ] If this PR adds or changes contract storage, I followed [Storage and TTL](https://github.com/nebgov/nebgov/blob/main/CONTRIBUTING.md#storage-and-ttl): bumps on persistent writes and hot reads, instance bumps in entrypoints, and a named TTL constant

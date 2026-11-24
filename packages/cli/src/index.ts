@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { registerGuardianCouncil } from "./guardianCouncil.js";
+import { registerTimelock } from "./timelock.js";
+import { registerRecurringStreams } from "./recurringStreams.js";
+import { registerVoteCommitReveal } from "./commitReveal.js";
 import { loadConfig as loadCouncilConfig } from "./config.js";
 
 import { Command } from "commander";
@@ -288,7 +291,7 @@ program
       }),
   );
 
-program
+const voteGroup = program
   .command("vote")
   .description("Vote commands")
   .addCommand(
@@ -1234,10 +1237,14 @@ program
       }),
   );
 
-registerGuardianCouncil(program, async () => {
+const loadCliContext = async () => {
   const global = program.opts<GlobalOptions>();
   return { global, cfg: await loadCouncilConfig(global.config) };
-});
+};
+registerGuardianCouncil(program, loadCliContext);
+registerTimelock(program, loadCliContext);
+registerRecurringStreams(program, loadCliContext);
+registerVoteCommitReveal(voteGroup, loadCliContext);
 
 program.parseAsync(process.argv).catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
