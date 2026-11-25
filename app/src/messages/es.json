@@ -499,5 +499,36 @@
     "loadingWizard": "Cargando asistente...",
     "loadingSettings": "Loading settings...",
     "estimated": "(estimado)"
+  },
+  "delegation": {
+    "title": "Delegar poder de voto",
+    "description": "Delega en ti mismo para activar tu poder de voto, o elige otra dirección.",
+    "currentlyDelegatingTo": "Actualmente estás delegando en",
+    "useUndelegation": "Usa la revocación de delegación para devolver el poder a ti mismo.",
+    "you": "Tú",
+    "notConnected": "No conectado",
+    "delegateToMyself": "Delegarme a mí mismo",
+    "addressPlaceholder": "Dirección de Stellar (G...)",
+    "addressRequired": "La dirección es obligatoria.",
+    "delegating": "Delegando...",
+    "delegateButton": "Delegar",
+    "updating": "Actualizando...",
+    "undelegateButton": "Revocar delegación",
+    "delegationSubmitted": "¡Delegación enviada!",
+    "undelegationSubmitted": "¡Revocación de delegación enviada!",
+    "viewOnExplorer": "Ver en Explorador →",
+    "delegationFailed": "La delegación falló",
+    "undelegationFailed": "La revocación de delegación falló",
+    "orDelegateWithoutGas": "O delega sin pagar gas",
+    "delegateFree": "Delega gratis — nosotros pagamos la tarifa",
+    "signOffChain": "Firma fuera de la cadena, nuestro relayer envía la transacción",
+    "splitDelegation": "Dividir mi delegación en su lugar →",
+    "splitDescription": "Distribuye tu poder de voto entre múltiples delegados por porcentaje"
+  },
+  "bonds": {
+    "locked": "Bloqueado",
+    "refunded": "Reembolsado",
+    "slashed": "Penalizado",
+    "unknown": "Desconocido"
   }
 }

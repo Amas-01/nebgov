@@ -11,7 +11,9 @@
     "confirm": "Confirm",
     "view": "View",
     "copy": "Copy",
-    "copied": "Copied!"
+    "copied": "Copied!",
+    "tryAgain": "Try again",
+    "tryAgainLater": "Please try again in a moment."
   },
   "nav": {
     "proposals": "Proposals",
@@ -499,5 +501,36 @@
     "loadingWizard": "Loading wizard...",
     "loadingSettings": "Loading settings...",
     "estimated": "(estimated)"
+  },
+  "delegation": {
+    "title": "Delegate Voting Power",
+    "description": "Delegate to yourself to activate your voting power, or choose another address.",
+    "currentlyDelegatingTo": "You are currently delegating to",
+    "useUndelegation": "Use undelegation to move power back to yourself.",
+    "you": "You",
+    "notConnected": "Not connected",
+    "delegateToMyself": "Delegate to myself",
+    "addressPlaceholder": "Stellar address (G...)",
+    "addressRequired": "Address is required.",
+    "delegating": "Delegating...",
+    "delegateButton": "Delegate",
+    "updating": "Updating...",
+    "undelegateButton": "Undelegate",
+    "delegationSubmitted": "Delegation submitted!",
+    "undelegationSubmitted": "Undelegation submitted!",
+    "viewOnExplorer": "View on Explorer →",
+    "delegationFailed": "Delegation failed",
+    "undelegationFailed": "Undelegation failed",
+    "orDelegateWithoutGas": "Or delegate without paying gas",
+    "delegateFree": "Delegate for free — we pay the fee",
+    "signOffChain": "Sign off-chain, our relayer submits the transaction",
+    "splitDelegation": "Split my delegation instead →",
+    "splitDescription": "Spread your voting power across multiple delegates by percentage"
+  },
+  "bonds": {
+    "locked": "Locked",
+    "refunded": "Refunded",
+    "slashed": "Slashed",
+    "unknown": "Unknown"
   }
 }
